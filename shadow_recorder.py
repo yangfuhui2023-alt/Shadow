@@ -226,7 +226,8 @@ def merge_and_save(tmp_video, sys_wav, mic_wav, output, signals: MergeSignals):
         cmd = ['ffmpeg', '-y']
         for i in inputs:
             cmd += ['-i', i]
-        cmd += maps + meta + ['-c:v', 'copy', '-c:a', 'aac', output]
+        cmd += maps + meta + ['-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+                               '-pix_fmt', 'yuv420p', '-c:a', 'aac', output]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         ok = result.returncode == 0
@@ -437,6 +438,7 @@ class ScreenWindow(QWidget):
         self.on_ch_changed = None
 
         # ── 字幕卡片 ──────────────────────────────────────────────────────
+        self.on_subtitle_srt = None   # callback(text) 供 CameraWindow 记录 SRT
         self._subtitle_card = SubtitleCard(self)
         self._subtitle_proc = None
         self._sub_lang_idx  = 0   # 语言索引（对应 SUBTITLE_LANGS）
@@ -525,8 +527,9 @@ class ScreenWindow(QWidget):
             self._subtitle_proc.start(code)
 
     def _on_subtitle_text(self, text: str):
-        # 从后台线程安全更新 UI（通过 QTimer 单次触发）
         QTimer.singleShot(0, lambda: self._subtitle_card.show_text(text))
+        if self.on_subtitle_srt:
+            self.on_subtitle_srt(text)
 
     def closeEvent(self, e):
         if self._subtitle_proc:
@@ -649,6 +652,11 @@ class CameraWindow(QWidget):
         self._rec_sys     = None   # SystemAudioRecorder（ScreenCaptureKit）
         self._rec_mic     = None   # AudioRecorder（麦克风）
 
+        # 连接字幕 → SRT 记录
+        self._prev_sub    = ""
+        self._prev_sub_t  = 0.0
+        screen_win.on_subtitle_srt = self._record_srt_entry
+
         # 合并信号
         self._merge_sig = MergeSignals()
         self._merge_sig.done.connect(self._on_merge_done)
@@ -762,6 +770,9 @@ class CameraWindow(QWidget):
         self._tmp_sys   = f"_tmp_sys_{ts}.caf"   # ScreenCaptureKit 输出 CAF
         self._tmp_mic   = f"_tmp_mic_{ts}.wav"
         self._final_out = f"shadow_{ts}.mp4"
+        self._srt_out   = f"shadow_{ts}.srt"
+        self._srt_data  = []   # [(start_sec, end_sec, text)]
+        self._rec_t0    = None # 录制起始时间
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self._vid_writer = cv2.VideoWriter(self._tmp_video, fourcc, 30, (WIN_W, TOTAL_H))
@@ -779,6 +790,7 @@ class CameraWindow(QWidget):
         self._rec_mic = AudioRecorder(self.mic_idx)
         self._rec_mic.start()
 
+        self._rec_t0 = time.time()
         self.recording = True
         self.screen_win.set_recording(True)
         self._style_rec(True)
@@ -813,15 +825,51 @@ class CameraWindow(QWidget):
                 mic_wav = self._tmp_mic
             self._rec_mic = None
 
+        # 写 SRT 字幕文件
+        self._write_srt()
+
         # 后台合并
         merge_and_save(self._tmp_video, sys_wav, mic_wav,
                        self._final_out, self._merge_sig)
 
+    def _record_srt_entry(self, text: str):
+        """由 ScreenWindow.on_subtitle_srt 回调，仅在录制期间记录。"""
+        if not self.recording or self._rec_t0 is None:
+            return
+        now = time.time()
+        rel = now - self._rec_t0
+        if text != self._prev_sub:
+            if self._prev_sub:
+                self._srt_data.append((self._prev_sub_t, rel, self._prev_sub))
+            self._prev_sub   = text
+            self._prev_sub_t = rel
+
+    def _write_srt(self):
+        # 收尾最后一条
+        if self._prev_sub and self._rec_t0:
+            dur = time.time() - self._rec_t0
+            self._srt_data.append((self._prev_sub_t, dur, self._prev_sub))
+        self._prev_sub = ""
+
+        def fmt(sec):
+            h, r = divmod(max(0, sec), 3600)
+            m, s = divmod(r, 60)
+            return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int((s%1)*1000):03d}"
+
+        with open(self._srt_out, "w", encoding="utf-8") as f:
+            for i, (s, e, text) in enumerate(self._srt_data, 1):
+                e = max(e, s + 0.5)
+                f.write(f"{i}\n{fmt(s)} --> {fmt(e)}\n{text}\n\n")
+        count = len(self._srt_data)
+        self._srt_data = []
+        print(f"[SRT] {self._srt_out}  ({count} 条)")
+
     def _on_merge_done(self, ok: bool, path: str):
         self.rec_btn.setEnabled(True)
         if ok:
-            name = os.path.basename(path)
-            self.status_label.setText(f"✓ 已保存：{name}")
+            srt_name = os.path.basename(self._srt_out)
+            name     = os.path.basename(path)
+            self.status_label.setText(f"✓ {name} + {srt_name}")
             self.status_label.setStyleSheet("color:#44cc88;font-size:10px;background:transparent;")
         else:
             self.status_label.setText("⚠ 合并失败，检查 ffmpeg")
