@@ -10,15 +10,17 @@ Shadow Recorder
 import sys, cv2, numpy as np, subprocess, threading, wave, os, time
 from datetime import datetime
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SWIFT_BIN  = os.path.join(SCRIPT_DIR, "audio_capture")   # 预编译 Swift 工具
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+SWIFT_BIN     = os.path.join(SCRIPT_DIR, "audio_capture")        # 系统音频录制
+SUBTITLE_BIN  = os.path.join(SCRIPT_DIR, "subtitle_recognizer")  # 实时字幕识别
 
 import sounddevice as sd
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton,
                               QInputDialog)
-from PyQt6.QtCore    import QTimer, Qt, QPoint, QObject, pyqtSignal
-from PyQt6.QtGui     import (QImage, QPixmap, QPainter, QColor, QPen, QFont)
+from PyQt6.QtCore    import QTimer, Qt, QPoint, QObject, pyqtSignal, QRect
+from PyQt6.QtGui     import (QImage, QPixmap, QPainter, QColor, QPen, QFont,
+                              QFontMetrics)
 
 import mss
 
@@ -239,6 +241,174 @@ def merge_and_save(tmp_video, sys_wav, mic_wav, output, signals: MergeSignals):
     threading.Thread(target=_run, daemon=True).start()
 
 
+# ── 字幕识别进程管理 ──────────────────────────────────────────────────────────
+SUBTITLE_LANGS = [("EN", "en-US"), ("ZH", "zh-CN"), ("JP", "ja-JP")]
+
+class SubtitleProcess:
+    """管理 subtitle_recognizer 进程，通过回调推送识别文本。"""
+
+    def __init__(self, on_text):
+        self._proc      = None
+        self._on_text   = on_text
+        self.active     = False
+        self.error      = None
+        self._lang      = "en-US"
+
+    def start(self, lang="en-US"):
+        if self.active:
+            self.stop()
+        self._lang  = lang
+        self.error  = None
+        if not os.path.exists(SUBTITLE_BIN):
+            self.error = "subtitle_recognizer 工具不存在"
+            return False
+        try:
+            self._proc = subprocess.Popen(
+                [SUBTITLE_BIN, lang],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True, bufsize=1)
+            ready = threading.Event()
+            threading.Thread(target=self._watch_stderr,
+                             args=(ready,), daemon=True).start()
+            threading.Thread(target=self._watch_stdout, daemon=True).start()
+            if not ready.wait(timeout=8):
+                self.error = "启动超时"
+                self.stop()
+                return False
+            self.active = True
+            return True
+        except Exception as e:
+            self.error = str(e)
+            return False
+
+    def _watch_stderr(self, ready_event: threading.Event):
+        if not self._proc: return
+        for line in self._proc.stderr:
+            line = line.strip()
+            if "READY" in line:
+                ready_event.set()
+            elif "ERROR" in line:
+                self.error = line
+                ready_event.set()   # unblock even on error
+
+    def _watch_stdout(self):
+        if not self._proc: return
+        for line in self._proc.stdout:
+            text = line.strip()
+            if text:
+                self._on_text(text)
+
+    def stop(self):
+        self.active = False
+        if self._proc:
+            self._proc.terminate()
+            try:   self._proc.wait(timeout=4)
+            except subprocess.TimeoutExpired: self._proc.kill()
+            self._proc = None
+
+
+# ── 字幕卡片控件 ───────────────────────────────────────────────────────────────
+class SubtitleCard(QWidget):
+    """
+    半透明黑色圆角卡片，显示识别字幕。
+    自动定位在录屏区内容底部，4 秒无更新后渐隐。
+    """
+    PADDING_H = 14
+    PADDING_V = 10
+    RADIUS    = 10
+    FONT_SIZE = 13
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._text    = ""
+        self._opacity = 0.0
+
+        self._hold_t  = QTimer(self)   # 显示保持计时器
+        self._hold_t.setSingleShot(True)
+        self._hold_t.timeout.connect(self._begin_fade)
+
+        self._fade_t  = QTimer(self)   # 渐隐动画
+        self._fade_t.timeout.connect(self._tick_fade)
+
+        self.hide()
+
+    # ── 外部调用 ──────────────────────────────────────────────────────────
+    def show_text(self, text: str):
+        self._text    = text
+        self._opacity = 1.0
+        self._fade_t.stop()
+        self._hold_t.stop()
+        self._hold_t.start(4000)
+        self._reposition()
+        self.show()
+        self.raise_()
+        self.update()
+
+    def clear(self):
+        self._hold_t.stop()
+        self._fade_t.stop()
+        self._opacity = 0.0
+        self._text    = ""
+        self.hide()
+
+    # ── 动画 ──────────────────────────────────────────────────────────────
+    def _begin_fade(self):
+        self._fade_t.start(40)
+
+    def _tick_fade(self):
+        self._opacity = max(0.0, self._opacity - 0.04)
+        if self._opacity <= 0.0:
+            self._fade_t.stop()
+            self.hide()
+        else:
+            self.update()
+
+    # ── 定位（紧贴内容区底部）────────────────────────────────────────────
+    def _reposition(self):
+        if not self._text or not self.parent():
+            return
+        par   = self.parent()
+        fm    = QFontMetrics(QFont("Helvetica", self.FONT_SIZE))
+        max_w = par.width() - 40
+        br    = fm.boundingRect(
+            QRect(0, 0, max_w, 2000),
+            Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignCenter,
+            self._text)
+        w = min(br.width()  + self.PADDING_H * 2, par.width() - 20)
+        h = br.height() + self.PADDING_V  * 2
+        x = (par.width() - w) // 2
+        # 内容区 = TOPBAR 到 (height - HANDLE)
+        content_bottom = par.height() - HANDLE
+        y = content_bottom - h - 12
+        self.setGeometry(x, y, w, h)
+
+    # ── 绘制 ──────────────────────────────────────────────────────────────
+    def paintEvent(self, _):
+        if not self._text or self._opacity <= 0.0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setOpacity(self._opacity)
+
+        # 卡片背景
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 210))
+        p.drawRoundedRect(self.rect(), self.RADIUS, self.RADIUS)
+
+        # 文字
+        p.setOpacity(self._opacity)
+        p.setPen(QColor(255, 255, 255))
+        p.setFont(QFont("Helvetica", self.FONT_SIZE))
+        inner = self.rect().adjusted(self.PADDING_H, self.PADDING_V,
+                                     -self.PADDING_H, -self.PADDING_V)
+        p.drawText(inner,
+                   Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignCenter,
+                   self._text)
+        p.end()
+
+
 # ── 录屏区窗口 ────────────────────────────────────────────────────────────────
 class ScreenWindow(QWidget):
     def __init__(self):
@@ -265,6 +435,31 @@ class ScreenWindow(QWidget):
         self._res_ch0   = 0
 
         self.on_ch_changed = None
+
+        # ── 字幕卡片 ──────────────────────────────────────────────────────
+        self._subtitle_card = SubtitleCard(self)
+        self._subtitle_proc = None
+        self._sub_lang_idx  = 0   # 语言索引（对应 SUBTITLE_LANGS）
+
+        self._sub_btn = QPushButton("字幕", self)
+        self._sub_btn.setFixedSize(42, 16)
+        self._sub_btn.move(WIN_W - 54, 4)
+        self._sub_btn.setStyleSheet(
+            "QPushButton{color:#555;background:transparent;border:1px solid #444;"
+            "border-radius:3px;font-size:9px;}"
+            "QPushButton:hover{color:#aaa;border-color:#777;}"
+            "QPushButton:checked{color:#44cc88;border-color:#44cc88;}")
+        self._sub_btn.setCheckable(True)
+        self._sub_btn.clicked.connect(self._toggle_subtitle)
+
+        self._lang_btn = QPushButton("EN", self)
+        self._lang_btn.setFixedSize(24, 16)
+        self._lang_btn.move(WIN_W - 8 - 24, 4)
+        self._lang_btn.setStyleSheet(
+            "QPushButton{color:#555;background:transparent;border:1px solid #333;"
+            "border-radius:3px;font-size:9px;}"
+            "QPushButton:hover{color:#aaa;}")
+        self._lang_btn.clicked.connect(self._cycle_lang)
 
     def set_sys_audio_ok(self, ok: bool):
         self.sys_audio_ok = ok
@@ -300,6 +495,44 @@ class ScreenWindow(QWidget):
         cx, cy = vx + vw//2, vy + vh//2
         self.move(cx - WIN_W//2, cy - self.height()//2)
 
+    # ── 字幕控制 ──────────────────────────────────────────────────────────
+    def _toggle_subtitle(self, checked: bool):
+        if checked:
+            lang_code = SUBTITLE_LANGS[self._sub_lang_idx][1]
+            self._subtitle_proc = SubtitleProcess(self._on_subtitle_text)
+            ok = self._subtitle_proc.start(lang_code)
+            if not ok:
+                print(f"[字幕] 启动失败: {self._subtitle_proc.error}")
+                self._sub_btn.setChecked(False)
+                self._subtitle_proc = None
+            else:
+                self._sub_btn.setText("字幕 ON")
+        else:
+            if self._subtitle_proc:
+                self._subtitle_proc.stop()
+                self._subtitle_proc = None
+            self._subtitle_card.clear()
+            self._sub_btn.setText("字幕")
+
+    def _cycle_lang(self):
+        self._sub_lang_idx = (self._sub_lang_idx + 1) % len(SUBTITLE_LANGS)
+        label, code = SUBTITLE_LANGS[self._sub_lang_idx]
+        self._lang_btn.setText(label)
+        # 若字幕正在运行则重启
+        if self._subtitle_proc and self._subtitle_proc.active:
+            self._subtitle_proc.stop()
+            self._subtitle_proc = SubtitleProcess(self._on_subtitle_text)
+            self._subtitle_proc.start(code)
+
+    def _on_subtitle_text(self, text: str):
+        # 从后台线程安全更新 UI（通过 QTimer 单次触发）
+        QTimer.singleShot(0, lambda: self._subtitle_card.show_text(text))
+
+    def closeEvent(self, e):
+        if self._subtitle_proc:
+            self._subtitle_proc.stop()
+        e.accept()
+
     # ── 内部 ──────────────────────────────────────────────────────────────
     def _do_blink(self):
         self._blink = not self._blink
@@ -330,14 +563,10 @@ class ScreenWindow(QWidget):
         p.setFont(QFont("Helvetica", 9))
         p.setPen(QColor("#777"))
         p.drawText(8, 16, f"录屏区  {WIN_W}×{self._ch}")
-        audio_clr  = QColor("#44cc88") if self.sys_audio_ok else QColor("#555")
-        audio_text = "🎵 系统音频" if self.sys_audio_ok else "🔇 无系统音频"
-        p.setPen(audio_clr)
-        p.drawText(WIN_W - 8 - p.fontMetrics().horizontalAdvance(audio_text), 16, audio_text)
         if blink_on:
             p.setPen(QColor("#ff4444"))
             p.setFont(QFont("Helvetica", 9, QFont.Weight.Bold))
-            p.drawText(WIN_W - 62, 16, "⏺  REC")
+            p.drawText(WIN_W - 140, 16, "⏺  REC")
         p.end()
 
     def mousePressEvent(self, e):

@@ -6,6 +6,7 @@ _tmp_*
 
 # 编译产物（Swift 二进制，可由源码重新编译）
 audio_capture
+subtitle_recognizer
 
 # macOS / IDE
 .DS_Store
