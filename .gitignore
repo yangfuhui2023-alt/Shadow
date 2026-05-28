@@ -1,0 +1,14 @@
+# 录制输出文件
+*.mp4
+*.wav
+*.caf
+_tmp_*
+
+# 编译产物（Swift 二进制，可由源码重新编译）
+audio_capture
+
+# macOS / IDE
+.DS_Store
+.claude/
+__pycache__/
+*.pyc
