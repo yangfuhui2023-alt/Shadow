@@ -663,6 +663,12 @@ class CameraWindow(QWidget):
         self.rec_btn.clicked.connect(self._toggle_recording)
         self._style_rec(False)
 
+        # 预扫描字幕 按钮（实验功能）
+        self._prescan_btn = QPushButton("预扫描字幕", self)
+        self._prescan_btn.setFixedSize(112, 36)
+        self._prescan_btn.clicked.connect(self._toggle_prescan)
+        self._style_prescan(False)
+
         # 关闭按钮
         self.close_btn = QPushButton("✕", self)
         self.close_btn.setFixedSize(28, 28)
@@ -693,6 +699,13 @@ class CameraWindow(QWidget):
         self._tmp_mic     = None
         self._rec_sys     = None   # SystemAudioRecorder（ScreenCaptureKit）
         self._rec_mic     = None   # AudioRecorder（麦克风）
+
+        # 预扫描状态
+        self.prescanning     = False
+        self._prescan_data   = []      # [(start_sec, end_sec, text)]
+        self._prescan_t0     = None
+        self._prescan_prev   = ""
+        self._prescan_prev_t = 0.0
 
         # 连接字幕 → SRT 记录
         self._prev_sub    = ""
@@ -739,7 +752,11 @@ class CameraWindow(QWidget):
     def _layout(self):
         ch = self._ch
         self.cam_label.setGeometry(0, 0, WIN_W, ch)
-        self.rec_btn.move(WIN_W//2 - 48, ch - 46)
+        gap   = 8
+        total = self._prescan_btn.width() + gap + self.rec_btn.width()
+        x0    = (WIN_W - total) // 2
+        self._prescan_btn.move(x0, ch - 46)
+        self.rec_btn.move(x0 + self._prescan_btn.width() + gap, ch - 46)
         self.close_btn.move(WIN_W - 34, 6)
         self.status_label.setGeometry(0, ch - 68, WIN_W, 18)
 
@@ -887,16 +904,91 @@ class CameraWindow(QWidget):
                        self._final_out, self._merge_sig, video_scale)
 
     def _record_srt_entry(self, text: str):
-        """由 ScreenWindow.on_subtitle_srt 回调，仅在录制期间记录。"""
-        if not self.recording or self._rec_t0 is None:
-            return
+        """由 ScreenWindow.on_subtitle_srt 回调；录制或预扫描期间均记录。"""
         now = time.time()
-        rel = now - self._rec_t0
-        if text != self._prev_sub:
-            if self._prev_sub:
-                self._srt_data.append((self._prev_sub_t, rel, self._prev_sub))
-            self._prev_sub   = text
-            self._prev_sub_t = rel
+        if self.recording and self._rec_t0 is not None:
+            rel = now - self._rec_t0
+            if text != self._prev_sub:
+                if self._prev_sub:
+                    self._srt_data.append((self._prev_sub_t, rel, self._prev_sub))
+                self._prev_sub   = text
+                self._prev_sub_t = rel
+        if self.prescanning and self._prescan_t0 is not None:
+            rel = now - self._prescan_t0
+            if text != self._prescan_prev:
+                if self._prescan_prev:
+                    self._prescan_data.append((self._prescan_prev_t, rel, self._prescan_prev))
+                self._prescan_prev   = text
+                self._prescan_prev_t = rel
+
+    # ── 预扫描 ────────────────────────────────────────────────────────────
+    def _toggle_prescan(self):
+        if self.recording:
+            return  # 录制中禁止启动预扫描
+        if self.prescanning:
+            self._stop_prescan()
+        else:
+            self._start_prescan()
+
+    def _start_prescan(self):
+        # 自动开启字幕识别（如果尚未开启）
+        sw = self.screen_win
+        if not sw._sub_btn.isChecked():
+            sw._sub_btn.setChecked(True)
+            sw._toggle_subtitle(True)
+
+        self._prescan_data   = []
+        self._prescan_prev   = ""
+        self._prescan_prev_t = 0.0
+        self._prescan_t0     = time.time()
+        self.prescanning     = True
+        self._prescan_btn.setText("■ 结束扫描")
+        self._style_prescan(True)
+        self.rec_btn.setEnabled(False)
+        self.status_label.setText("正在预扫描字幕…")
+        self.status_label.setStyleSheet("color:#66aaff;font-size:10px;background:transparent;")
+
+    def _stop_prescan(self):
+        self.prescanning = False
+        # 收尾最后一条
+        if self._prescan_prev and self._prescan_t0:
+            dur = time.time() - self._prescan_t0
+            self._prescan_data.append((self._prescan_prev_t, dur, self._prescan_prev))
+        self._prescan_prev = ""
+
+        def fmt(sec):
+            h, r = divmod(max(0, sec), 3600)
+            m, s = divmod(r, 60)
+            return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int((s%1)*1000):03d}"
+
+        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(OUTPUT_DIR, f"prescan_{ts}.srt")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            for i, (s, e, text) in enumerate(self._prescan_data, 1):
+                e = max(e, s + 0.5)
+                f.write(f"{i}\n{fmt(s)} --> {fmt(e)}\n{text}\n\n")
+
+        count = len(self._prescan_data)
+        print(f"[预扫描] {out}  ({count} 条)")
+
+        self._prescan_btn.setText("预扫描字幕")
+        self._style_prescan(False)
+        self.rec_btn.setEnabled(True)
+        self.status_label.setText(f"✓ 预扫描 {count} 条 → prescan_{ts}.srt")
+        self.status_label.setStyleSheet("color:#44cc88;font-size:10px;background:transparent;")
+
+    def _style_prescan(self, on: bool):
+        if on:
+            self._prescan_btn.setStyleSheet(
+                "QPushButton{color:#fff;background:#555;border:none;border-radius:18px;font-weight:bold;}"
+                "QPushButton:hover{background:#666;}"
+                "QPushButton:pressed{background:#444;}")
+        else:
+            self._prescan_btn.setStyleSheet(
+                "QPushButton{color:#fff;background:#2266dd;border:none;border-radius:18px;font-weight:bold;}"
+                "QPushButton:hover{background:#3377ee;}"
+                "QPushButton:pressed{background:#1155bb;}")
 
     def _write_srt(self):
         # 收尾最后一条
