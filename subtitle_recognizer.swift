@@ -54,7 +54,7 @@ final class Recognizer: @unchecked Sendable {
     private func _startLocked() {
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults   = true
-        req.requiresOnDeviceRecognition  = true   // 不限时，离线运行
+        req.requiresOnDeviceRecognition  = false  // 服务端识别，更准确
         request = req
         active  = true
 

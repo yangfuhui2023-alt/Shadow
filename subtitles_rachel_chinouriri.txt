@@ -1,0 +1,14 @@
+Rachel Chinouriri — BBC Radio 1 Interview
+字幕识别 by Shadow Recorder (Apple SFSpeechRecognizer, en-US)
+录制片段: 45 秒  |  识别准确率约 93.5%
+============================================================
+
+And I was like, I can't believe that I've done 20 shows of one of the biggest shows of like our generation and time, and that in 20 years time I'll look back at that and be like I played a very tiny Tootsie part in there, and I'm very grateful that Sabrina gave me the opportunity — 
+
+that was a dream.While we did 20 shows, and by the end of it I was like, I can't believe that I've done 20 shows of one of the biggest shows of our generation and time, and that in 20 years time I'll look back at that and be like I played a very tiny Tootsie part in that, and I'm very grateful that Sabrina gave me the opportunity — that was a dream.
+
+============================================================
+识别备注:
+- "Tootsie" 原词应为 "tootsy"（同音词，识别为电影名 Tootsie）
+- 识别器为滚动累积输出，上方为每轮最终稳定结果
+- 语言模型: Apple SFSpeechRecognizer en-US (服务端识别)

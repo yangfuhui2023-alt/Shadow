@@ -11,8 +11,10 @@ import sys, cv2, numpy as np, subprocess, threading, wave, os, time
 from datetime import datetime
 
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
-SWIFT_BIN     = os.path.join(SCRIPT_DIR, "audio_capture")        # 系统音频录制
-SUBTITLE_BIN  = os.path.join(SCRIPT_DIR, "subtitle_recognizer")  # 实时字幕识别
+SWIFT_BIN     = os.path.join(SCRIPT_DIR, "audio_capture")
+SUBTITLE_BIN  = os.path.join(SCRIPT_DIR, "subtitle_recognizer")
+OUTPUT_DIR    = os.path.join(SCRIPT_DIR, "screentest")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 import sounddevice as sd
 
@@ -211,23 +213,46 @@ class MergeSignals(QObject):
 
 
 # ── ffmpeg 合并（后台线程） ────────────────────────────────────────────────────
-def merge_and_save(tmp_video, sys_wav, mic_wav, output, signals: MergeSignals):
+def merge_and_save(tmp_video, sys_wav, mic_wav, output, signals: MergeSignals,
+                   video_scale: float = 1.0):
     def _run():
-        inputs = [tmp_video]
-        maps, meta = ['-map', '0:v'], []
-        ai = 0
+        # 视频流时间戳缩放（修正 cv2 写入器以固定 30fps 标签时长 ≠ 实际录制时长的问题）
+        inputs = [(tmp_video, ['-itsscale', f'{video_scale:.6f}'])]
+        audio_info = []   # [(input_idx, title)]
         for wav, title in [(sys_wav, 'System Audio'), (mic_wav, 'Microphone')]:
             if wav and os.path.exists(wav):
-                inputs.append(wav)
-                maps += ['-map', f'{len(inputs)-1}:a']
-                meta += [f'-metadata:s:a:{ai}', f'title={title}']
-                ai   += 1
+                inputs.append((wav, []))
+                audio_info.append((len(inputs) - 1, title))
+
+        maps  = ['-map', '0:v']
+        meta  = []
+        disp  = []
+        ai    = 0
+        fcomp = None
+
+        # 两路音频齐全时，合成一条默认混音轨（系统音 + 麦克风），原始两轨保留供剪辑
+        if len(audio_info) == 2:
+            a0, a1 = audio_info[0][0], audio_info[1][0]
+            fcomp  = f"[{a0}:a][{a1}:a]amix=inputs=2:duration=longest[mixed]"
+            maps += ['-map', '[mixed]']
+            meta += [f'-metadata:s:a:{ai}', 'title=Mixed (System + Mic)']
+            disp += [f'-disposition:a:{ai}', 'default']
+            ai   += 1
+
+        for in_idx, title in audio_info:
+            maps += ['-map', f'{in_idx}:a']
+            meta += [f'-metadata:s:a:{ai}', f'title={title}']
+            if fcomp:
+                disp += [f'-disposition:a:{ai}', '0']
+            ai   += 1
 
         cmd = ['ffmpeg', '-y']
-        for i in inputs:
-            cmd += ['-i', i]
-        cmd += maps + meta + ['-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
-                               '-pix_fmt', 'yuv420p', '-c:a', 'aac', output]
+        for path, in_opts in inputs:
+            cmd += in_opts + ['-i', path]
+        if fcomp:
+            cmd += ['-filter_complex', fcomp]
+        cmd += maps + meta + disp + ['-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+                                      '-pix_fmt', 'yuv420p', '-c:a', 'aac', output]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         ok = result.returncode == 0
@@ -769,10 +794,11 @@ class CameraWindow(QWidget):
         self._tmp_video = f"_tmp_video_{ts}.mp4"
         self._tmp_sys   = f"_tmp_sys_{ts}.caf"   # ScreenCaptureKit 输出 CAF
         self._tmp_mic   = f"_tmp_mic_{ts}.wav"
-        self._final_out = f"shadow_{ts}.mp4"
-        self._srt_out   = f"shadow_{ts}.srt"
+        self._final_out = os.path.join(OUTPUT_DIR, f"shadow_{ts}.mp4")
+        self._srt_out   = os.path.join(OUTPUT_DIR, f"shadow_{ts}.srt")
         self._srt_data  = []   # [(start_sec, end_sec, text)]
         self._rec_t0    = None # 录制起始时间
+        self._frames_written = 0
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self._vid_writer = cv2.VideoWriter(self._tmp_video, fourcc, 30, (WIN_W, TOTAL_H))
@@ -828,9 +854,20 @@ class CameraWindow(QWidget):
         # 写 SRT 字幕文件
         self._write_srt()
 
+        # 计算视频时间戳缩放比：cv2 写入器以 30fps 标签时长，但实际录制帧率往往更低
+        video_scale = 1.0
+        if self._frames_written > 0 and self._rec_t0:
+            elapsed     = time.time() - self._rec_t0
+            nominal_dur = self._frames_written / 30.0
+            if nominal_dur > 0:
+                video_scale = elapsed / nominal_dur
+                print(f"[视频] 写入 {self._frames_written} 帧 / {elapsed:.2f}s "
+                      f"= {self._frames_written/elapsed:.1f} fps "
+                      f"(itsscale={video_scale:.3f})")
+
         # 后台合并
         merge_and_save(self._tmp_video, sys_wav, mic_wav,
-                       self._final_out, self._merge_sig)
+                       self._final_out, self._merge_sig, video_scale)
 
     def _record_srt_entry(self, text: str):
         """由 ScreenWindow.on_subtitle_srt 回调，仅在录制期间记录。"""
@@ -867,9 +904,12 @@ class CameraWindow(QWidget):
     def _on_merge_done(self, ok: bool, path: str):
         self.rec_btn.setEnabled(True)
         if ok:
-            srt_name = os.path.basename(self._srt_out)
             name     = os.path.basename(path)
-            self.status_label.setText(f"✓ {name} + {srt_name}")
+            srt_name = os.path.basename(self._srt_out)
+            self.status_label.setText(f"✓ 已保存至 screentest/")
+            self.status_label.setStyleSheet("color:#44cc88;font-size:10px;background:transparent;")
+            print(f"[保存] 视频: {path}")
+            print(f"[保存] 字幕: {self._srt_out}")
             self.status_label.setStyleSheet("color:#44cc88;font-size:10px;background:transparent;")
         else:
             self.status_label.setText("⚠ 合并失败，检查 ffmpeg")
@@ -914,6 +954,7 @@ class CameraWindow(QWidget):
                 if cam_bgr.shape[0] != cch:
                     cam_bgr = letterbox(cam_bgr, WIN_W, cch)
                 self._vid_writer.write(np.vstack([scr_bgr, cam_bgr]))
+                self._frames_written += 1
             except Exception as ex:
                 print(f"[record] {ex}")
 

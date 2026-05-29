@@ -20,12 +20,13 @@ final class AudioWriter: @unchecked Sendable {
         try? FileManager.default.removeItem(at: url)
         writer = try AVAssetWriter(outputURL: url, fileType: .caf)
         let fmt: [String: Any] = [
-            AVFormatIDKey:             Int(kAudioFormatLinearPCM),
-            AVSampleRateKey:           44100,
-            AVNumberOfChannelsKey:     2,
-            AVLinearPCMBitDepthKey:    16,
-            AVLinearPCMIsFloatKey:     false,
-            AVLinearPCMIsBigEndianKey: false
+            AVFormatIDKey:                  Int(kAudioFormatLinearPCM),
+            AVSampleRateKey:                44100,
+            AVNumberOfChannelsKey:          2,
+            AVLinearPCMBitDepthKey:         16,
+            AVLinearPCMIsFloatKey:          false,
+            AVLinearPCMIsBigEndianKey:      false,
+            AVLinearPCMIsNonInterleaved:    false
         ]
         input = AVAssetWriterInput(mediaType: .audio, outputSettings: fmt)
         input.expectsMediaDataInRealTime = true

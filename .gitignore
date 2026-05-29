@@ -7,6 +7,13 @@ _tmp_*
 # 编译产物（Swift 二进制，可由源码重新编译）
 audio_capture
 subtitle_recognizer
+ocr_frame
+
+# 录制输出目录
+screentest/
+
+# 评测运行时报告
+eval_report_*.txt
 
 # macOS / IDE
 .DS_Store
