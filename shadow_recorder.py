@@ -48,6 +48,16 @@ def letterbox(frame_bgr: np.ndarray, tw: int, th: int) -> np.ndarray:
     return c
 
 
+# ── Cover（填满 + 居中裁剪，无黑边） ─────────────────────────────────────────
+def cover(frame_bgr: np.ndarray, tw: int, th: int) -> np.ndarray:
+    fh, fw = frame_bgr.shape[:2]
+    scale  = max(tw / fw, th / fh)
+    nw, nh = int(fw * scale + 0.5), int(fh * scale + 0.5)
+    r = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+    x0, y0 = (nw - tw) // 2, (nh - th) // 2
+    return r[y0:y0+th, x0:x0+tw]
+
+
 # ── 音频录制器 ────────────────────────────────────────────────────────────────
 class AudioRecorder:
     """从指定设备录音，停止后写为 WAV 文件。"""
@@ -174,7 +184,14 @@ class SystemAudioRecorder:
 
 # ── 音频设备检测 ──────────────────────────────────────────────────────────────
 def list_input_devices():
-    """返回所有可用输入设备列表 [(idx, name), ...]。"""
+    """返回所有可用输入设备列表 [(idx, name), ...]。
+    每次调用前重新初始化 PortAudio，确保能看到 Shadow 启动后才连接的设备
+    （如 AirPods）。"""
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception:
+        pass
     result = []
     for i, d in enumerate(sd.query_devices()):
         if d['max_input_channels'] > 0:
@@ -935,7 +952,7 @@ class CameraWindow(QWidget):
         ret, frame = self.cap.read()
         cam_bgr = None
         if ret:
-            cam_bgr = letterbox(cv2.flip(frame, 1), WIN_W, self._ch)
+            cam_bgr = cover(cv2.flip(frame, 1), WIN_W, self._ch)
             rgb = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
             h, w, c = rgb.shape
             self.cam_label.setPixmap(
@@ -952,7 +969,7 @@ class CameraWindow(QWidget):
                                      (WIN_W, sch), interpolation=cv2.INTER_AREA)
                 cch = TOTAL_H - sch
                 if cam_bgr.shape[0] != cch:
-                    cam_bgr = letterbox(cam_bgr, WIN_W, cch)
+                    cam_bgr = cover(cam_bgr, WIN_W, cch)
                 self._vid_writer.write(np.vstack([scr_bgr, cam_bgr]))
                 self._frames_written += 1
             except Exception as ex:
@@ -1024,9 +1041,19 @@ if __name__ == "__main__":
     screen_win = ScreenWindow()
     camera_win = CameraWindow(screen_win, mic_idx, mic_name)
 
-    # 高度联动
-    def _on_scr_ch(ch): camera_win.set_content_h(TOTAL_H - ch, emit=False)
-    def _on_cam_ch(ch): screen_win.set_content_h(TOTAL_H - ch, emit=False)
+    # 高度联动 — 改完高度后把摄像区移到录屏区正下方，避免独立窗口位置不同步导致重叠/分离
+    def _relayout_cam_below_scr():
+        sp = screen_win.pos()
+        camera_win.move(sp.x(), sp.y() + screen_win.height() + 6)
+
+    def _on_scr_ch(ch):
+        camera_win.set_content_h(TOTAL_H - ch, emit=False)
+        _relayout_cam_below_scr()
+
+    def _on_cam_ch(ch):
+        screen_win.set_content_h(TOTAL_H - ch, emit=False)
+        _relayout_cam_below_scr()
+
     screen_win.on_ch_changed = _on_scr_ch
     camera_win.on_ch_changed = _on_cam_ch
 
