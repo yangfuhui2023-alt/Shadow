@@ -7,7 +7,7 @@ Shadow Recorder
 输出：shadow_时间戳.mp4（450×800，含两条独立音轨）
 首次运行需在「系统设置 → 隐私 → 屏幕录制」中授权。
 """
-import sys, cv2, numpy as np, subprocess, threading, wave, os, time
+import sys, cv2, numpy as np, subprocess, threading, wave, os, time, atexit, signal
 from datetime import datetime
 
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -315,7 +315,8 @@ class SubtitleProcess:
             threading.Thread(target=self._watch_stderr,
                              args=(ready,), daemon=True).start()
             threading.Thread(target=self._watch_stdout, daemon=True).start()
-            if not ready.wait(timeout=8):
+            # 给 server→local fallback 留时间（服务端探测最长约 6s + 重启缓冲）
+            if not ready.wait(timeout=18):
                 self.error = "启动超时"
                 self.stop()
                 return False
@@ -345,9 +346,15 @@ class SubtitleProcess:
     def stop(self):
         self.active = False
         if self._proc:
-            self._proc.terminate()
-            try:   self._proc.wait(timeout=4)
-            except subprocess.TimeoutExpired: self._proc.kill()
+            # 优雅退出 1.5s 即放弃，强杀避免 ScreenCaptureKit 资源被僵尸占住
+            try:
+                self._proc.terminate()
+                try: self._proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    try: self._proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired: pass
+            except Exception: pass
             self._proc = None
 
 
@@ -1025,6 +1032,19 @@ def detect_video_bounds():
     except Exception:
         pass
     return None
+
+
+def _cleanup_children():
+    """退出时强杀所有 audio_capture / subtitle_recognizer 子进程，避免僵尸占住 ScreenCaptureKit。"""
+    for name in ("subtitle_recognizer", "audio_capture"):
+        try:
+            subprocess.run(["pkill", "-9", "-f", f"{SCRIPT_DIR}/{name}"],
+                           timeout=2, capture_output=True)
+        except Exception: pass
+
+atexit.register(_cleanup_children)
+signal.signal(signal.SIGTERM, lambda *_: (_cleanup_children(), sys.exit(0)))
+signal.signal(signal.SIGINT,  lambda *_: (_cleanup_children(), sys.exit(0)))
 
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
