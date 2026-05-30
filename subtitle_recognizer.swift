@@ -40,10 +40,22 @@ final class Recognizer: @unchecked Sendable {
     private let lock           = NSLock()
     var active                 = false
 
+    // 双路 fallback 状态
+    private var useOnDevice    = false   // 当前会话用端上识别
+    private var sessionStarted = Date()
+    private var hasResult      = false   // 本次会话是否拿到过结果
+
     init?(locale: Locale) {
-        guard let r = SFSpeechRecognizer(locale: locale), r.isAvailable else { return nil }
+        guard let r = SFSpeechRecognizer(locale: locale) else { return nil }
         sfRecognizer = r
         sfRecognizer.defaultTaskHint = .dictation
+        // 初始策略：服务端不可用就直接走端上（不再因 !isAvailable 失败退出）
+        if !r.isAvailable && r.supportsOnDeviceRecognition {
+            useOnDevice = true
+            fputs("[recognizer] 服务端不可用，初始即用端上识别\n", stderr)
+        } else if !r.isAvailable {
+            fputs("[recognizer] 服务端不可用且端上不支持当前语言 — 仍尝试启动\n", stderr)
+        }
     }
 
     func start() {
@@ -54,30 +66,36 @@ final class Recognizer: @unchecked Sendable {
     private func _startLocked() {
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults   = true
-        req.requiresOnDeviceRecognition  = false  // 服务端识别，更准确
+        req.requiresOnDeviceRecognition  = useOnDevice
         request = req
         active  = true
+        sessionStarted = Date()
+        hasResult      = false
+
+        fputs("MODE: \(useOnDevice ? "local" : "server")\n", stderr)
 
         task = sfRecognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self else { return }
             if let result {
-                let text = result.bestTranscription.formattedString
+                self.lock.lock(); self.hasResult = true; self.lock.unlock()
+                let text    = result.bestTranscription.formattedString
+                let isFinal = result.isFinal
                 self.lock.lock()
                 let prev = self.lastPrinted
                 self.lock.unlock()
 
-                if text != prev && !text.isEmpty {
-                    print(text)
+                if !text.isEmpty && (text != prev || isFinal) {
+                    let prefix = isFinal ? "F:" : "P:"
+                    print("\(prefix)\(text)")
                     fflush(stdout)
                     self.lock.lock()
                     self.lastPrinted = text
                     self.lock.unlock()
                 }
-                if result.isFinal {
+                if isFinal {
                     self.lock.lock()
                     self.lastPrinted = ""
                     self.lock.unlock()
-                    // 最终结果后短暂延迟再重启，避免丢帧
                     recognQ.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                         self?.lock.lock()
                         if self?.active == true { self?._startLocked() }
@@ -87,7 +105,16 @@ final class Recognizer: @unchecked Sendable {
             }
             if let error = error {
                 let nsErr = error as NSError
-                // 超时或结束时自动重启
+                // Fallback 判断：当前在服务端、整个会话没拿到过结果、且耗时短 → 切端上
+                self.lock.lock()
+                let elapsed       = Date().timeIntervalSince(self.sessionStarted)
+                let shouldFallback = !self.useOnDevice && !self.hasResult && elapsed < 6
+                                     && self.sfRecognizer.supportsOnDeviceRecognition
+                self.lock.unlock()
+                if shouldFallback {
+                    fputs("[recognizer] 服务端识别启动失败 (\(error.localizedDescription))，降级到端上识别\n", stderr)
+                    self.lock.lock(); self.useOnDevice = true; self.lock.unlock()
+                }
                 if nsErr.code != 1110 && nsErr.code != 216 {
                     fputs("[recognizer] \(error.localizedDescription)\n", stderr)
                 }
@@ -99,7 +126,24 @@ final class Recognizer: @unchecked Sendable {
             }
         }
 
-        // 45 秒后主动结束任务触发重启（Apple 服务端识别有 60s 上限）
+        // Watchdog：服务端模式下 4 秒还没拿到任何结果 → 主动取消触发降级
+        let initiallyOnDevice = useOnDevice
+        recognQ.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let stuck = self.active && !self.hasResult
+                        && !initiallyOnDevice && !self.useOnDevice
+                        && self.sfRecognizer.supportsOnDeviceRecognition
+            let currentTask = self.task
+            self.lock.unlock()
+            if stuck {
+                fputs("[recognizer] 服务端 4 秒无响应，降级到端上识别\n", stderr)
+                self.lock.lock(); self.useOnDevice = true; self.lock.unlock()
+                currentTask?.cancel()   // 触发 error 回调 → 重启走端上
+            }
+        }
+
+        // 45 秒会话上限（端上无此限制，但统一处理）
         recognQ.asyncAfter(deadline: .now() + 45) { [weak self] in
             self?.lock.lock()
             if self?.active == true { self?.request?.endAudio() }
@@ -138,8 +182,10 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
 }
 
 // ── 权限请求 ──────────────────────────────────────────────────────────────────
+fputs("DEBUG: 1 启动，请求 Speech 授权…\n", stderr)
 let speechSema = DispatchSemaphore(value: 0)
 SFSpeechRecognizer.requestAuthorization { status in
+    fputs("DEBUG: 2 授权回调 status=\(status.rawValue)\n", stderr)
     if status != .authorized {
         fputs("ERROR: 语音识别未授权。请在「系统设置 → 隐私 → 语音识别」中开启。\n", stderr)
         exit(1)
@@ -147,11 +193,13 @@ SFSpeechRecognizer.requestAuthorization { status in
     speechSema.signal()
 }
 speechSema.wait()
+fputs("DEBUG: 3 授权通过，创建 Recognizer…\n", stderr)
 
 guard let recognizer = Recognizer(locale: Locale(identifier: langCode)) else {
     fputs("ERROR: 无法创建识别器（语言：\(langCode)）\n", stderr)
     exit(1)
 }
+fputs("DEBUG: 4 Recognizer 创建成功\n", stderr)
 
 // ── 启动 ScreenCaptureKit ─────────────────────────────────────────────────────
 var scStream:    SCStream?
@@ -171,11 +219,14 @@ installStopHandlers {
     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { exit(0) }
 }
 
+fputs("DEBUG: 5 请求 SCShareableContent…\n", stderr)
 SCShareableContent.getWithCompletionHandler { content, error in
+    fputs("DEBUG: 6 SCShareableContent 回调\n", stderr)
     guard let display = content?.displays.first else {
         fputs("ERROR: 无法获取屏幕内容（\(error?.localizedDescription ?? "unknown")）\n", stderr)
         exit(1)
     }
+    fputs("DEBUG: 7 已获取 display，准备创建 SCStream…\n", stderr)
 
     let cfg = SCStreamConfiguration()
     cfg.capturesAudio               = true
@@ -190,7 +241,9 @@ SCShareableContent.getWithCompletionHandler { content, error in
 
     do {
         try stream.addStreamOutput(capture, type: .audio, sampleHandlerQueue: audioQ)
+        fputs("DEBUG: 8 已 addStreamOutput，调用 startCapture…\n", stderr)
         stream.startCapture { err in
+            fputs("DEBUG: 9 startCapture 回调\n", stderr)
             if let err {
                 fputs("ERROR: \(err)\n", stderr)
                 exit(1)

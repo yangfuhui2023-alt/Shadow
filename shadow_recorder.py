@@ -7,8 +7,9 @@ Shadow Recorder
 输出：shadow_时间戳.mp4（450×800，含两条独立音轨）
 首次运行需在「系统设置 → 隐私 → 屏幕录制」中授权。
 """
-import sys, cv2, numpy as np, subprocess, threading, wave, os, time
+import sys, cv2, numpy as np, subprocess, threading, wave, os, time, atexit, signal
 from datetime import datetime
+from enum import Enum
 
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 SWIFT_BIN     = os.path.join(SCRIPT_DIR, "audio_capture")
@@ -19,7 +20,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 import sounddevice as sd
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton,
-                              QInputDialog)
+                              QInputDialog, QScrollArea, QPlainTextEdit, QTextEdit,
+                              QVBoxLayout, QHBoxLayout, QFileDialog)
 from PyQt6.QtCore    import QTimer, Qt, QPoint, QObject, pyqtSignal, QRect
 from PyQt6.QtGui     import (QImage, QPixmap, QPainter, QColor, QPen, QFont,
                               QFontMetrics)
@@ -32,6 +34,15 @@ INIT_CH = 400
 MIN_CH  = 100
 MAX_CH  = 700
 BORDER  = 3
+SUB_INIT_H = 220
+SUB_MIN_H  = 80
+SUB_MAX_H  = 1400   # 放宽上限，允许字幕区拉到接近屏幕高度
+SUB_TOPBAR = 22
+
+# 圆形摄像气泡尺寸（悬浮窗，不参与窗口高度联动）
+CAM_BUBBLE_W   = 220
+CAM_BUBBLE_H   = 220   # 圆形区域
+CAM_BTN_AREA_H = 60    # 按钮行高
 HANDLE  = 12
 TOPBAR  = 24
 SR      = 44100
@@ -315,7 +326,8 @@ class SubtitleProcess:
             threading.Thread(target=self._watch_stderr,
                              args=(ready,), daemon=True).start()
             threading.Thread(target=self._watch_stdout, daemon=True).start()
-            if not ready.wait(timeout=8):
+            # 给 server→local fallback 留时间（服务端探测最长约 6s + 重启缓冲）
+            if not ready.wait(timeout=18):
                 self.error = "启动超时"
                 self.stop()
                 return False
@@ -338,16 +350,28 @@ class SubtitleProcess:
     def _watch_stdout(self):
         if not self._proc: return
         for line in self._proc.stdout:
-            text = line.strip()
-            if text:
-                self._on_text(text)
+            line = line.strip()
+            if not line: continue
+            if line.startswith("F:"):
+                self._on_text(line[2:], True)
+            elif line.startswith("P:"):
+                self._on_text(line[2:], False)
+            else:
+                # 兼容旧版无前缀输出 → 当作 partial
+                self._on_text(line, False)
 
     def stop(self):
         self.active = False
         if self._proc:
-            self._proc.terminate()
-            try:   self._proc.wait(timeout=4)
-            except subprocess.TimeoutExpired: self._proc.kill()
+            # 优雅退出 1.5s 即放弃，强杀避免 ScreenCaptureKit 资源被僵尸占住
+            try:
+                self._proc.terminate()
+                try: self._proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    try: self._proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired: pass
+            except Exception: pass
             self._proc = None
 
 
@@ -568,10 +592,10 @@ class ScreenWindow(QWidget):
             self._subtitle_proc = SubtitleProcess(self._on_subtitle_text)
             self._subtitle_proc.start(code)
 
-    def _on_subtitle_text(self, text: str):
+    def _on_subtitle_text(self, text: str, is_final: bool):
         QTimer.singleShot(0, lambda: self._subtitle_card.show_text(text))
         if self.on_subtitle_srt:
-            self.on_subtitle_srt(text)
+            self.on_subtitle_srt(text, is_final)
 
     def closeEvent(self, e):
         if self._subtitle_proc:
@@ -647,41 +671,41 @@ class CameraWindow(QWidget):
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
                             Qt.WindowType.WindowStaysOnTopHint)
-        self.setFixedWidth(WIN_W)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # 由于按钮已转移到 ControlCard，气泡只有圆形预览，去掉按钮行
+        self.setFixedSize(CAM_BUBBLE_W, CAM_BUBBLE_H)
+        # _ch 仅用于录制端合成（保留 WIN_W × _ch 的摄像区，不再驱动窗口尺寸）
         self._ch = INIT_CH
-        self.resize(WIN_W, self._ch + HANDLE)
+        self._latest_pix = None  # 圆形预览最新帧
         self.setMouseTracking(True)
 
-        # 摄像画面
-        self.cam_label = QLabel(self)
-        self.cam_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.cam_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-
-        # REC 按钮
+        # REC / 预扫描 按钮 — 保留为占位但隐藏（操作走 ControlCard）
         self.rec_btn = QPushButton("● REC", self)
-        self.rec_btn.setFixedSize(96, 36)
+        self.rec_btn.setFixedSize(86, 32)
         self.rec_btn.clicked.connect(self._toggle_recording)
         self._style_rec(False)
+        self.rec_btn.hide()
 
-        # 预扫描字幕 按钮（实验功能）
-        self._prescan_btn = QPushButton("预扫描字幕", self)
-        self._prescan_btn.setFixedSize(112, 36)
+        self._prescan_btn = QPushButton("预扫描", self)
+        self._prescan_btn.setFixedSize(76, 32)
         self._prescan_btn.clicked.connect(self._toggle_prescan)
         self._style_prescan(False)
+        self._prescan_btn.hide()
 
         # 关闭按钮
         self.close_btn = QPushButton("✕", self)
-        self.close_btn.setFixedSize(28, 28)
+        self.close_btn.setFixedSize(22, 22)
         self.close_btn.setStyleSheet(
-            "QPushButton{color:#555;background:transparent;border:none;font-size:14px;}"
-            "QPushButton:hover{color:#fff;background:rgba(180,0,0,180);border-radius:14px;}")
+            "QPushButton{color:#888;background:rgba(0,0,0,140);border:none;"
+            "border-radius:11px;font-size:11px;}"
+            "QPushButton:hover{color:#fff;background:rgba(180,0,0,200);}")
         self.close_btn.clicked.connect(QApplication.quit)
 
-        # 状态标签（保存进度）
+        # 状态标签
         self.status_label = QLabel("", self)
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.status_label.setStyleSheet("color:#888; font-size:10px; background:transparent;")
+        self.status_label.setStyleSheet("color:#888;font-size:9px;background:transparent;")
 
         self._layout()
 
@@ -706,6 +730,7 @@ class CameraWindow(QWidget):
         self._prescan_t0     = None
         self._prescan_prev   = ""
         self._prescan_prev_t = 0.0
+        self.on_prescan_saved = None   # callback(path) — 完成后通知字幕窗口
 
         # 连接字幕 → SRT 记录
         self._prev_sub    = ""
@@ -739,62 +764,57 @@ class CameraWindow(QWidget):
         return self._ch
 
     def set_content_h(self, ch: int, emit=True):
+        # 圆形气泡窗口尺寸固定；_ch 仅用于录制端合成
         ch = max(MIN_CH, min(MAX_CH, ch))
         if ch == self._ch: return
         self._ch = ch
-        self.resize(WIN_W, ch + HANDLE)
-        self._layout()
-        self.update()
         if emit and self.on_ch_changed:
             self.on_ch_changed(ch)
 
     # ── 布局 ──────────────────────────────────────────────────────────────
     def _layout(self):
-        ch = self._ch
-        self.cam_label.setGeometry(0, 0, WIN_W, ch)
-        gap   = 8
+        gap   = 6
         total = self._prescan_btn.width() + gap + self.rec_btn.width()
-        x0    = (WIN_W - total) // 2
-        self._prescan_btn.move(x0, ch - 46)
-        self.rec_btn.move(x0 + self._prescan_btn.width() + gap, ch - 46)
-        self.close_btn.move(WIN_W - 34, 6)
-        self.status_label.setGeometry(0, ch - 68, WIN_W, 18)
+        x0    = (CAM_BUBBLE_W - total) // 2
+        btn_y = CAM_BUBBLE_H + (CAM_BTN_AREA_H - self.rec_btn.height()) // 2
+        self._prescan_btn.move(x0, btn_y)
+        self.rec_btn.move(x0 + self._prescan_btn.width() + gap, btn_y)
+        self.close_btn.move(CAM_BUBBLE_W - 26, 4)
+        self.status_label.setGeometry(0, CAM_BUBBLE_H - 16, CAM_BUBBLE_W, 14)
 
     def resizeEvent(self, e):
         self._layout(); super().resizeEvent(e)
 
     # ── 绘制 ──────────────────────────────────────────────────────────────
     def paintEvent(self, _):
+        from PyQt6.QtCore import QRectF
         p = QPainter(self)
-        h = self.height()
-        p.fillRect(0, 0, WIN_W, h, QColor(10, 10, 10))
-        clr = QColor("#ff3333") if self.recording else QColor("#1e1e1e")
-        p.setPen(QPen(clr, BORDER)); p.setBrush(Qt.BrushStyle.NoBrush)
-        b = BORDER // 2
-        p.drawRect(b, b, WIN_W - BORDER, h - BORDER)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        p.fillRect(0, h-HANDLE, WIN_W, HANDLE, QColor(18, 18, 18))
-        cx = WIN_W // 2
-        p.setPen(QColor(72, 72, 72))
-        for off in (-12, 0, 12):
-            p.drawLine(cx+off-5, h-6, cx+off+5, h-6)
+        # 圆形摄像区
+        circle = QRectF(0, 0, CAM_BUBBLE_W, CAM_BUBBLE_H)
+        from PyQt6.QtGui import QPainterPath
+        path = QPainterPath()
+        path.addEllipse(circle.adjusted(1, 1, -1, -1))
 
-        # 手柄：摄像区尺寸 + 麦克风设备
-        p.setFont(QFont("Helvetica", 8))
-        info = f"摄像区 {WIN_W}×{self._ch}"
-        p.setPen(QColor("#303030"))
-        p.drawText(8, h - 2, info)
+        p.save()
+        p.setClipPath(path)
+        p.fillRect(circle, QColor(8, 8, 8))
+        if self._latest_pix is not None:
+            p.drawPixmap(0, 0, CAM_BUBBLE_W, CAM_BUBBLE_H, self._latest_pix)
+        p.restore()
 
-        mic_clr = QColor("#44cc88") if self.mic_idx is not None else QColor("#444")
-        p.setPen(mic_clr)
-        short_mic = self.mic_name[:20] + ("…" if len(self.mic_name) > 20 else "")
-        p.drawText(WIN_W - 8 - p.fontMetrics().horizontalAdvance(f"🎤 {short_mic}"),
-                   h - 2, f"🎤 {short_mic}")
+        # 圆形边框：录制时红色亮，闲时柔灰
+        clr = QColor("#ff3333") if self.recording else QColor(255, 255, 255, 40)
+        p.setPen(QPen(clr, 2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(circle.adjusted(1, 1, -1, -1))
+
         p.end()
 
     def mouseDoubleClickEvent(self, e):
-        """双击手柄区域切换麦克风设备。"""
-        if e.position().toPoint().y() >= self.height() - HANDLE:
+        """双击圆形区域切换麦克风设备。"""
+        if e.position().toPoint().y() <= CAM_BUBBLE_H:
             self._pick_mic()
 
     def _pick_mic(self):
@@ -903,23 +923,28 @@ class CameraWindow(QWidget):
         merge_and_save(self._tmp_video, sys_wav, mic_wav,
                        self._final_out, self._merge_sig, video_scale)
 
-    def _record_srt_entry(self, text: str):
-        """由 ScreenWindow.on_subtitle_srt 回调；录制或预扫描期间均记录。"""
+    def _record_srt_entry(self, text: str, is_final: bool):
+        """由 ScreenWindow.on_subtitle_srt 回调；录制或预扫描期间均记录。
+        Partial 仅用于记下当前句的起始时间；Final 时正式落条，避免重复堆叠。"""
         now = time.time()
         if self.recording and self._rec_t0 is not None:
             rel = now - self._rec_t0
-            if text != self._prev_sub:
-                if self._prev_sub:
-                    self._srt_data.append((self._prev_sub_t, rel, self._prev_sub))
-                self._prev_sub   = text
+            if self._prev_sub == "":
                 self._prev_sub_t = rel
+            self._prev_sub = text
+            if is_final:
+                self._srt_data.append((self._prev_sub_t, rel, text))
+                self._prev_sub   = ""
+                self._prev_sub_t = 0.0
         if self.prescanning and self._prescan_t0 is not None:
             rel = now - self._prescan_t0
-            if text != self._prescan_prev:
-                if self._prescan_prev:
-                    self._prescan_data.append((self._prescan_prev_t, rel, self._prescan_prev))
-                self._prescan_prev   = text
+            if self._prescan_prev == "":
                 self._prescan_prev_t = rel
+            self._prescan_prev = text
+            if is_final:
+                self._prescan_data.append((self._prescan_prev_t, rel, text))
+                self._prescan_prev   = ""
+                self._prescan_prev_t = 0.0
 
     # ── 预扫描 ────────────────────────────────────────────────────────────
     def _toggle_prescan(self):
@@ -949,6 +974,15 @@ class CameraWindow(QWidget):
         self.status_label.setStyleSheet("color:#66aaff;font-size:10px;background:transparent;")
 
     def _stop_prescan(self):
+        # 收尾阶段 1：保留 prescanning=True 继续收集 ASR 在管线中的尾段，
+        # 2 秒后才真正写盘。覆盖音频/识别管线的 1~2s 端到端延迟。
+        self._prescan_btn.setEnabled(False)
+        self._prescan_btn.setText("收尾中…")
+        self.status_label.setText("正在收尾，等待 ASR 末段…")
+        self.status_label.setStyleSheet("color:#aaa;font-size:10px;background:transparent;")
+        QTimer.singleShot(2000, self._finalize_prescan)
+
+    def _finalize_prescan(self):
         self.prescanning = False
         # 收尾最后一条
         if self._prescan_prev and self._prescan_t0:
@@ -972,11 +1006,15 @@ class CameraWindow(QWidget):
         count = len(self._prescan_data)
         print(f"[预扫描] {out}  ({count} 条)")
 
-        self._prescan_btn.setText("预扫描字幕")
+        self._prescan_btn.setText("预扫描")
+        self._prescan_btn.setEnabled(True)
         self._style_prescan(False)
         self.rec_btn.setEnabled(True)
         self.status_label.setText(f"✓ 预扫描 {count} 条 → prescan_{ts}.srt")
         self.status_label.setStyleSheet("color:#44cc88;font-size:10px;background:transparent;")
+
+        if self.on_prescan_saved:
+            self.on_prescan_saved(out)
 
     def _style_prescan(self, on: bool):
         if on:
@@ -1042,15 +1080,18 @@ class CameraWindow(QWidget):
     # ── 帧循环 ────────────────────────────────────────────────────────────
     def _tick(self):
         ret, frame = self.cap.read()
-        cam_bgr = None
+        flipped = None
         if ret:
-            cam_bgr = cover(cv2.flip(frame, 1), WIN_W, self._ch)
-            rgb = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
+            flipped = cv2.flip(frame, 1)
+            # 圆形预览（220×220 cover）
+            preview = cover(flipped, CAM_BUBBLE_W, CAM_BUBBLE_H)
+            rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
             h, w, c = rgb.shape
-            self.cam_label.setPixmap(
-                QPixmap.fromImage(QImage(rgb.data, w, h, w*c, QImage.Format.Format_RGB888)))
+            self._latest_pix = QPixmap.fromImage(
+                QImage(rgb.data, w, h, w*c, QImage.Format.Format_RGB888))
+            self.update()
 
-        if self.recording and self._vid_writer and cam_bgr is not None:
+        if self.recording and self._vid_writer and flipped is not None:
             try:
                 region  = self.screen_win.get_capture_region()
                 shot    = self.sct.grab(region)
@@ -1059,42 +1100,557 @@ class CameraWindow(QWidget):
                 sch     = self.screen_win.content_h
                 scr_bgr = cv2.resize(cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR),
                                      (WIN_W, sch), interpolation=cv2.INTER_AREA)
-                cch = TOTAL_H - sch
-                if cam_bgr.shape[0] != cch:
-                    cam_bgr = cover(cam_bgr, WIN_W, cch)
-                self._vid_writer.write(np.vstack([scr_bgr, cam_bgr]))
+                cch     = TOTAL_H - sch
+                # 录制用更宽的摄像帧（与屏幕区同宽，保留原合成格式）
+                rec_cam = cover(flipped, WIN_W, cch)
+                self._vid_writer.write(np.vstack([scr_bgr, rec_cam]))
                 self._frames_written += 1
             except Exception as ex:
                 print(f"[record] {ex}")
 
-    # ── 鼠标 ──────────────────────────────────────────────────────────────
+    # ── 鼠标（圆形气泡：整体可拖动；无 resize handle） ───────────────────
     def mousePressEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton: return
-        ly = e.position().toPoint().y()
-        gp = e.globalPosition().toPoint()
-        if ly >= self.height() - HANDLE:
-            self._resizing = True; self._res_y0 = gp.y(); self._res_ch0 = self._ch
-        else:
-            self._resizing          = False
-            self._drag_global_start = gp
-            self._drag_win_start    = self.pos()
+        self._drag_global_start = e.globalPosition().toPoint()
+        self._drag_win_start    = self.pos()
 
     def mouseMoveEvent(self, e):
-        ly = e.position().toPoint().y()
-        self.setCursor(Qt.CursorShape.SizeVerCursor if ly >= self.height()-HANDLE
-                       else Qt.CursorShape.OpenHandCursor)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
         if e.buttons() != Qt.MouseButton.LeftButton: return
         gp = e.globalPosition().toPoint()
-        if self._resizing:
-            self.set_content_h(self._res_ch0 + gp.y() - self._res_y0)
-        else:
-            self.move(self._drag_win_start + (gp - self._drag_global_start))
+        self.move(self._drag_win_start + (gp - self._drag_global_start))
 
     def closeEvent(self, e):
         self.timer.stop()
         if self.recording: self._stop()
         if self.cap.isOpened(): self.cap.release()
         e.accept()
+
+
+# ── 字幕条目（单条 SRT entry，时间戳 + 可编辑文本） ───────────────────────────
+def _fmt_srt_time(sec: float) -> str:
+    h, r = divmod(max(0, sec), 3600)
+    m, s = divmod(r, 60)
+    return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int((s%1)*1000):03d}"
+
+
+class SubtitleEntryRow(QWidget):
+    """单条 SRT entry — 顶部时间戳（只读小字），下面可编辑文本框。"""
+    text_changed = pyqtSignal()
+
+    def __init__(self, start: float, end: float, text: str, parent=None):
+        super().__init__(parent)
+        self.start = start
+        self.end   = end
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 4, 8, 6)
+        lay.setSpacing(2)
+
+        self.ts_label = QLabel(f"{_fmt_srt_time(start)}  →  {_fmt_srt_time(end)}")
+        self.ts_label.setStyleSheet("color:#888;font-size:9px;background:transparent;")
+        lay.addWidget(self.ts_label)
+
+        # 用 QTextEdit（非 QPlainTextEdit）— QPlainTextEdit 的 document.size() 不返回真实像素高度
+        self.edit = QTextEdit()
+        self.edit.setPlainText(text)
+        self.edit.setStyleSheet(
+            "QTextEdit{color:#eee;background:#1c1c1c;"
+            "border:1px solid #2c2c2c;border-radius:4px;font-size:13px;padding:4px;}"
+            "QTextEdit:focus{border:1px solid #4488dd;}")
+        self.edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.edit.setFixedWidth(WIN_W - 28)
+        self.edit.document().setDocumentMargin(4)
+        # 文档高度变化时重设固定高度
+        self.edit.document().documentLayout().documentSizeChanged.connect(self._on_doc_size_changed)
+        self.edit.textChanged.connect(self.text_changed.emit)
+        lay.addWidget(self.edit)
+        QTimer.singleShot(0, self._refit)
+
+    def _on_doc_size_changed(self, size):
+        h = int(size.height() + 14)
+        self.edit.setFixedHeight(max(28, h))
+
+    def _refit(self):
+        w = self.edit.viewport().width()
+        if w > 10:
+            self.edit.document().setTextWidth(w)
+        h = int(self.edit.document().size().height() + 14)
+        self.edit.setFixedHeight(max(28, h))
+
+    def resizeEvent(self, e):
+        self.edit.document().setTextWidth(self.edit.viewport().width())
+        super().resizeEvent(e)
+
+    def get_text(self) -> str:
+        return self.edit.toPlainText()
+
+
+# ── 字幕窗口 ─────────────────────────────────────────────────────────────────
+class SubtitleWindow(QWidget):
+    """独立字幕区：滚动列表，每条 SRT entry 可编辑。
+    自动加载 OUTPUT_DIR 下最新的 prescan_*.srt；编辑后 debounce 500ms 写回原文件。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.WindowStaysOnTopHint)
+        self.setFixedWidth(WIN_W)
+        self._ch = SUB_INIT_H
+        self.setFixedHeight(self._ch + SUB_TOPBAR + HANDLE)
+        self.setMouseTracking(True)
+
+        self._srt_path = None
+        self._rows     = []
+        self.on_ch_changed = None
+        # 默认折叠成一条 pill
+        self._collapsed   = True
+        self._expanded_h  = SUB_INIT_H
+
+        # 顶部条 + 滚动区
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.scroll.setStyleSheet(
+            "QScrollArea{background:#0d0d0d;}"
+            "QScrollBar:vertical{background:#1a1a1a;width:8px;}"
+            "QScrollBar::handle:vertical{background:#3a3a3a;border-radius:3px;}")
+
+        self.container = QWidget()
+        self.container.setStyleSheet("background:#0d0d0d;")
+        self.box = QVBoxLayout(self.container)
+        self.box.setContentsMargins(2, 2, 2, 2)
+        self.box.setSpacing(2)
+        self.scroll.setWidget(self.container)
+
+        self.placeholder = QLabel("暂无字幕\n\n点「预扫描字幕」生成", self.container)
+        self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.placeholder.setStyleSheet(
+            "color:#555;font-size:11px;padding:30px;background:transparent;")
+        self.box.addWidget(self.placeholder)
+        self.box.addStretch(1)
+
+        # debounce 保存
+        self._save_t = QTimer(self)
+        self._save_t.setSingleShot(True)
+        self._save_t.timeout.connect(self._save_now)
+
+        # 拖拽 / 缩放
+        self._resizing  = False
+        self._res_y0    = 0
+        self._res_ch0   = 0
+        self._drag_global_start = QPoint()
+        self._drag_win_start    = QPoint()
+
+        # 启动默认折叠
+        self._apply_collapsed_state()
+        self._layout()
+
+    # ── 几何 ──────────────────────────────────────────────────────────────
+    @property
+    def content_h(self):
+        return 0 if self._collapsed else self._ch
+
+    def set_content_h(self, ch: int, emit=True):
+        if self._collapsed: return
+        ch = max(SUB_MIN_H, min(SUB_MAX_H, ch))
+        if ch == self._ch: return
+        self._ch = ch
+        self.setFixedHeight(ch + SUB_TOPBAR + HANDLE)
+        self._layout()
+        self.update()
+        if emit and self.on_ch_changed:
+            self.on_ch_changed(ch)
+
+    def _apply_collapsed_state(self):
+        if self._collapsed:
+            self.scroll.setVisible(False)
+            self.setFixedHeight(SUB_TOPBAR + 4)
+        else:
+            self.scroll.setVisible(True)
+            self.setFixedHeight(self._ch + SUB_TOPBAR + HANDLE)
+        self.update()
+        if self.on_ch_changed:
+            self.on_ch_changed(self.content_h)
+
+    def toggle_collapsed(self):
+        if self._collapsed:
+            self._collapsed = False
+            self._ch = self._expanded_h
+        else:
+            self._expanded_h = self._ch
+            self._collapsed = True
+        self._apply_collapsed_state()
+        self._layout()
+
+    def _layout(self):
+        if self._collapsed:
+            return
+        self.scroll.setGeometry(BORDER, SUB_TOPBAR,
+                                WIN_W - 2*BORDER, self._ch - BORDER)
+
+    def resizeEvent(self, e):
+        self._layout(); super().resizeEvent(e)
+
+    # ── 绘制 ──────────────────────────────────────────────────────────────
+    def paintEvent(self, _):
+        p = QPainter(self)
+        h = self.height()
+        # pill / 顶部条
+        bg = QColor(0, 0, 0, 220) if self._collapsed else QColor(0, 0, 0, 200)
+        p.fillRect(0, 0, WIN_W, SUB_TOPBAR, bg)
+        if not self._collapsed:
+            p.setPen(QPen(QColor("#1e1e1e"), BORDER)); p.setBrush(Qt.BrushStyle.NoBrush)
+            b = BORDER // 2
+            p.drawRect(b, b, WIN_W - BORDER, h - BORDER)
+        p.setPen(QColor("#ddd")); p.setFont(QFont("Helvetica", 11, QFont.Weight.Bold))
+        p.drawText(10, 15, "字幕")
+        cnt = len(self._rows)
+        # 右侧：N 条 · ▾/▴
+        arrow = "▴" if not self._collapsed else "▾"
+        info  = f"{cnt} 条  {arrow}" if cnt else f"暂无  {arrow}"
+        p.setPen(QColor("#888")); p.setFont(QFont("Helvetica", 9))
+        fm = p.fontMetrics()
+        p.drawText(WIN_W - 10 - fm.horizontalAdvance(info), 15, info)
+        # 底部 handle（仅展开态显示）
+        if not self._collapsed:
+            p.fillRect(0, h-HANDLE, WIN_W, HANDLE, QColor(28, 28, 28, 220))
+            cx = WIN_W // 2
+            p.setPen(QPen(QColor("#666"), 2))
+            p.drawLine(cx-12, h-HANDLE//2, cx+12, h-HANDLE//2)
+        p.end()
+
+    # ── 鼠标（顶部右侧 ▾/▴ 切换折叠；顶部其余区域拖动；底部 handle 缩放） ─
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton: return
+        lp = e.position().toPoint()
+        ly, lx = lp.y(), lp.x()
+        gp = e.globalPosition().toPoint()
+        # 顶部最右 80px 视作"折叠开关"区
+        if ly <= SUB_TOPBAR and lx >= WIN_W - 80:
+            self.toggle_collapsed()
+            return
+        if not self._collapsed and ly >= self.height() - HANDLE:
+            self._resizing = True
+            self._res_y0   = gp.y()
+            self._res_ch0  = self._ch
+        elif ly <= SUB_TOPBAR:
+            self._resizing = False
+            self._drag_global_start = gp
+            self._drag_win_start    = self.pos()
+
+    def mouseMoveEvent(self, e):
+        ly = e.position().toPoint().y()
+        if ly >= self.height() - HANDLE:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif ly <= SUB_TOPBAR:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        if e.buttons() != Qt.MouseButton.LeftButton: return
+        gp = e.globalPosition().toPoint()
+        if self._resizing:
+            self.set_content_h(self._res_ch0 + gp.y() - self._res_y0)
+        elif not self._drag_global_start.isNull():
+            self.move(self._drag_win_start + (gp - self._drag_global_start))
+
+    # ── 字幕加载 / 保存 ──────────────────────────────────────────────────
+    def load_srt(self, path: str, auto_expand: bool = False):
+        """读取 SRT 文件，渲染为可编辑行。auto_expand=True 时若当前折叠则自动展开。"""
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as ex:
+            print(f"[字幕] 读取失败: {ex}")
+            return
+
+        entries = []
+        for block in content.strip().split("\n\n"):
+            lines = block.strip().split("\n")
+            if len(lines) < 3: continue
+            ts = lines[1]
+            try:
+                a, b = ts.split(" --> ")
+                def parse(t):
+                    h, m, rest = t.split(":")
+                    s, ms = rest.split(",")
+                    return int(h)*3600 + int(m)*60 + int(s) + int(ms)/1000
+                start, end = parse(a), parse(b)
+            except Exception:
+                continue
+            text = "\n".join(lines[2:])
+            entries.append((start, end, text))
+
+        self._srt_path = path
+        self._render_entries(entries)
+        if auto_expand and entries and self._collapsed:
+            self.toggle_collapsed()
+
+    def _render_entries(self, entries):
+        # 清掉旧 row
+        for r in self._rows:
+            r.setParent(None)
+            r.deleteLater()
+        self._rows = []
+        self.placeholder.setVisible(len(entries) == 0)
+
+        # 在 placeholder 之前/stretch 之前插入
+        insert_idx = self.box.indexOf(self.placeholder) + 1
+        for s, e, t in entries:
+            row = SubtitleEntryRow(s, e, t, self.container)
+            row.text_changed.connect(lambda: self._save_t.start(500))
+            self.box.insertWidget(insert_idx, row)
+            insert_idx += 1
+            self._rows.append(row)
+        self.update()
+        # 等所有 row 完成 _fit_height 后，再适配窗口高度
+        QTimer.singleShot(50, self._fit_window_to_content)
+
+    def _fit_window_to_content(self):
+        """加载新字幕后扩大窗口以显示全部 entry — **只增不减**，保护用户已编辑的状态。"""
+        if not self._rows: return
+        total = sum(r.sizeHint().height() + 2 for r in self._rows) + 8
+        from PyQt6.QtWidgets import QApplication
+        sc_h = QApplication.primaryScreen().geometry().height()
+        needed = max(SUB_MIN_H, min(total, sc_h - 200, SUB_MAX_H))
+        if self._collapsed:
+            # 折叠态下记忆为"展开后的最小高度"（也只增不减）
+            self._expanded_h = max(self._expanded_h, needed)
+        else:
+            # 当前比需要的小才扩张；用户已经调好的高度不动
+            if needed > self._ch:
+                self._ch = needed
+                self.setFixedHeight(needed + SUB_TOPBAR + HANDLE)
+                self._layout()
+                if self.on_ch_changed:
+                    self.on_ch_changed(needed)
+                self.update()
+
+    def _save_now(self):
+        if not self._srt_path or not self._rows:
+            return
+        try:
+            with open(self._srt_path, "w", encoding="utf-8") as f:
+                for i, row in enumerate(self._rows, 1):
+                    text = row.get_text().strip()
+                    if not text: continue
+                    f.write(f"{i}\n{_fmt_srt_time(row.start)} --> "
+                            f"{_fmt_srt_time(row.end)}\n{text}\n\n")
+            print(f"[字幕] 已保存 {self._srt_path}")
+        except Exception as ex:
+            print(f"[字幕] 保存失败: {ex}")
+
+
+# ── 应用阶段 ─────────────────────────────────────────────────────────────────
+class AppState(Enum):
+    ENTRY     = "entry"      # S0 — 入口卡片
+    PRESCAN   = "prescan"    # S1 — 正在预扫描字幕
+    PRACTICE  = "practice"   # S2 — 看字幕跟读练习
+    RECORDING = "recording"  # S3 — 正在录制
+    FINISHED  = "finished"   # S4 — 录制完成
+
+
+# ── 控制卡片 ─────────────────────────────────────────────────────────────────
+class ControlCard(QWidget):
+    """悬浮卡片 — 按用户流程阶段切换主操作。"""
+
+    CARD_W = 300
+    CARD_H = 130
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(self.CARD_W, self.CARD_H)
+
+        self.state = AppState.ENTRY
+        self._last_video         = None
+        self._last_prescan_path  = None
+
+        # 回调（由 main 装载）
+        self.on_start_prescan = None
+        self.on_stop_prescan  = None
+        self.on_continue_last = None
+        self.on_start_record  = None
+        self.on_stop_record   = None
+        self.on_record_again  = None
+        self.on_open_video    = None
+
+        # 标题
+        self.title = QLabel("开始", self)
+        self.title.setStyleSheet("color:#aaa;font-size:11px;background:transparent;")
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title.setGeometry(0, 14, self.CARD_W, 18)
+
+        # 主按钮
+        self.primary_btn = QPushButton("", self)
+        self.primary_btn.setFixedSize(240, 42)
+        self.primary_btn.move((self.CARD_W - 240)//2, 40)
+        self.primary_btn.clicked.connect(self._on_primary)
+
+        # 次要按钮（链接样式）
+        self.secondary_btn = QPushButton("", self)
+        self.secondary_btn.setFixedSize(160, 20)
+        self.secondary_btn.move((self.CARD_W - 160)//2, 92)
+        self.secondary_btn.clicked.connect(self._on_secondary)
+        self.secondary_btn.setStyleSheet(
+            "QPushButton{color:#888;background:transparent;border:none;"
+            "font-size:10px;text-decoration:underline;}"
+            "QPushButton:hover{color:#fff;}")
+
+        # 首句预览（仅 ENTRY 显示）
+        self.preview_label = QLabel("", self)
+        self.preview_label.setStyleSheet(
+            "color:#666;font-size:9px;background:transparent;font-style:italic;")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setGeometry(12, 112, self.CARD_W - 24, 14)
+        self.preview_label.setVisible(False)
+
+        # 关闭
+        self.close_btn = QPushButton("✕", self)
+        self.close_btn.setFixedSize(22, 22)
+        self.close_btn.move(self.CARD_W - 28, 6)
+        self.close_btn.setStyleSheet(
+            "QPushButton{color:#666;background:transparent;border:none;font-size:12px;}"
+            "QPushButton:hover{color:#fff;background:rgba(180,0,0,180);border-radius:11px;}")
+        self.close_btn.clicked.connect(QApplication.quit)
+
+        # 拖动
+        self._drag_global_start = QPoint()
+        self._drag_win_start    = QPoint()
+
+        self.set_state(AppState.ENTRY)
+
+    def paintEvent(self, _):
+        from PyQt6.QtCore import QRectF
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor(22, 22, 22, 240))
+        p.setPen(QPen(QColor(60, 60, 60), 1))
+        p.drawRoundedRect(QRectF(0.5, 0.5, self.width()-1, self.height()-1), 14, 14)
+        p.end()
+
+    def _style_primary(self, color: str):
+        styles = {
+            "blue": ("#2266dd", "#3377ee"),
+            "red":  ("#dd2222", "#e63333"),
+            "gray": ("#555",    "#666"),
+            "green":("#22aa66", "#33bb77"),
+        }
+        base, hover = styles.get(color, styles["blue"])
+        self.primary_btn.setStyleSheet(
+            f"QPushButton{{color:#fff;background:{base};border:none;"
+            f"border-radius:10px;font-weight:bold;font-size:13px;}}"
+            f"QPushButton:hover{{background:{hover};}}"
+            f"QPushButton:disabled{{color:#888;background:#333;}}")
+
+    def set_state(self, state: AppState):
+        self.state = state
+        s = state
+        self.primary_btn.setEnabled(True)
+        if s == AppState.ENTRY:
+            self.title.setVisible(False)
+            self.primary_btn.setText("▶ 开始预扫描字幕")
+            # 是否有可继续的上次预扫描？
+            latest = self._find_latest_prescan()
+            if latest:
+                path, first_line = latest
+                self._last_prescan_path = path
+                self.secondary_btn.setText("继续上次预扫描")
+                self.secondary_btn.setVisible(True)
+                snippet = first_line[:42] + ("…" if len(first_line) > 42 else "")
+                self.preview_label.setText(f"“{snippet}”")
+                self.preview_label.setVisible(True)
+            else:
+                self.secondary_btn.setVisible(False)
+                self.preview_label.setVisible(False)
+            self._style_primary("blue")
+        elif s == AppState.PRESCAN:
+            self.title.setVisible(True)
+            self.preview_label.setVisible(False)
+            self.title.setText("正在预扫描字幕…")
+            self.primary_btn.setText("■ 结束扫描")
+            self.secondary_btn.setVisible(False)
+            self._style_primary("gray")
+        elif s == AppState.PRACTICE:
+            self.title.setVisible(True)
+            self.preview_label.setVisible(False)
+            self.title.setText("练习中 — 看字幕跟读")
+            self.primary_btn.setText("● 开始录制")
+            self.secondary_btn.setText("重新预扫描")
+            self.secondary_btn.setVisible(True)
+            self._style_primary("red")
+        elif s == AppState.RECORDING:
+            self.title.setVisible(True)
+            self.preview_label.setVisible(False)
+            self.title.setText("正在录制…")
+            self.primary_btn.setText("■ 停止录制")
+            self.secondary_btn.setVisible(False)
+            self._style_primary("gray")
+        elif s == AppState.FINISHED:
+            self.title.setVisible(True)
+            self.preview_label.setVisible(False)
+            self.title.setText("✓ 已保存到 screentest/")
+            self.primary_btn.setText("再录一次")
+            self.secondary_btn.setText("打开视频")
+            self.secondary_btn.setVisible(True)
+            self._style_primary("green")
+        self.update()
+
+    def _on_primary(self):
+        s = self.state
+        if s == AppState.ENTRY     and self.on_start_prescan: self.on_start_prescan()
+        elif s == AppState.PRESCAN  and self.on_stop_prescan:  self.on_stop_prescan()
+        elif s == AppState.PRACTICE and self.on_start_record:  self.on_start_record()
+        elif s == AppState.RECORDING and self.on_stop_record:  self.on_stop_record()
+        elif s == AppState.FINISHED and self.on_record_again:  self.on_record_again()
+
+    def _on_secondary(self):
+        s = self.state
+        if s == AppState.ENTRY     and self.on_continue_last: self.on_continue_last(self._last_prescan_path)
+        elif s == AppState.PRACTICE and self.on_start_prescan: self.on_start_prescan()
+        elif s == AppState.FINISHED and self.on_open_video:    self.on_open_video()
+
+    def _find_latest_prescan(self):
+        """返回 (path, first_subtitle_line) 或 None。"""
+        import glob
+        candidates = sorted(
+            glob.glob(os.path.join(OUTPUT_DIR, "prescan_*.srt")),
+            key=os.path.getmtime, reverse=True)
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                for block in content.strip().split("\n\n"):
+                    lines = block.strip().split("\n")
+                    if len(lines) >= 3:
+                        text = " ".join(lines[2:]).strip()
+                        if text:
+                            return path, text
+            except Exception:
+                continue
+        return None
+
+    def set_busy(self, text: str):
+        """临时锁定（用于 drain 期等等）。"""
+        self.primary_btn.setText(text)
+        self.primary_btn.setEnabled(False)
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton: return
+        self._drag_global_start = e.globalPosition().toPoint()
+        self._drag_win_start    = self.pos()
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() != Qt.MouseButton.LeftButton: return
+        gp = e.globalPosition().toPoint()
+        self.move(self._drag_win_start + (gp - self._drag_global_start))
 
 
 # ── Chrome 视频检测 ───────────────────────────────────────────────────────────
@@ -1120,6 +1676,20 @@ def detect_video_bounds():
 
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
+def _cleanup_children():
+    """退出时强杀所有 audio_capture / subtitle_recognizer 子进程，避免僵尸占住 ScreenCaptureKit。"""
+    for name in ("subtitle_recognizer", "audio_capture"):
+        try:
+            subprocess.run(["pkill", "-9", "-f",
+                            f"{SCRIPT_DIR}/{name}"],
+                           timeout=2, capture_output=True)
+        except Exception: pass
+
+atexit.register(_cleanup_children)
+signal.signal(signal.SIGTERM, lambda *_: (_cleanup_children(), sys.exit(0)))
+signal.signal(signal.SIGINT,  lambda *_: (_cleanup_children(), sys.exit(0)))
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
@@ -1130,40 +1700,117 @@ if __name__ == "__main__":
     print(f"系统音频: {'ScreenCaptureKit ✓' if sys_ok else '工具缺失 (audio_capture)'}")
     print(f"麦克风:   [{mic_idx}] {mic_name or '未检测到'}")
 
-    screen_win = ScreenWindow()
-    camera_win = CameraWindow(screen_win, mic_idx, mic_name)
+    screen_win   = ScreenWindow()
+    camera_win   = CameraWindow(screen_win, mic_idx, mic_name)
+    subtitle_win = SubtitleWindow()
+    card         = ControlCard()
 
-    # 高度联动 — 改完高度后把摄像区移到录屏区正下方，避免独立窗口位置不同步导致重叠/分离
-    def _relayout_cam_below_scr():
-        sp = screen_win.pos()
-        camera_win.move(sp.x(), sp.y() + screen_win.height() + 6)
+    # 起步：仅显示控制卡片
+    screen_win.hide()
+    camera_win.hide()
+    subtitle_win.hide()
 
-    def _on_scr_ch(ch):
-        camera_win.set_content_h(TOTAL_H - ch, emit=False)
-        _relayout_cam_below_scr()
+    state = {"current": AppState.ENTRY, "last_video": None}
 
-    def _on_cam_ch(ch):
-        screen_win.set_content_h(TOTAL_H - ch, emit=False)
-        _relayout_cam_below_scr()
+    def position_subtitle_below_card():
+        cp = card.pos()
+        subtitle_win.move(cp.x() - (WIN_W - card.width())//2,
+                          cp.y() + card.height() + 8)
 
-    screen_win.on_ch_changed = _on_scr_ch
-    camera_win.on_ch_changed = _on_cam_ch
+    def position_camera_beside_card():
+        cp = card.pos()
+        camera_win.move(cp.x() + card.width() + 8, cp.y())
 
-    # 定位
-    bounds = detect_video_bounds()
-    sc     = app.primaryScreen().geometry()
-    if bounds:
-        vx, vy, vw, vh = bounds
-        print(f"视频检测成功: {vx},{vy}  {vw}×{vh}")
-        screen_win.position_on_video(vx, vy, vw, vh)
-        sp = screen_win.pos()
-        camera_win.move(sp.x(), sp.y() + screen_win.height() + 6)
-    else:
-        cx = sc.width()//2 - WIN_W//2
-        cy = max(0, sc.height()//2 - (screen_win.height() + 6 + camera_win.height())//2)
-        screen_win.move(cx, cy)
-        camera_win.move(cx, cy + screen_win.height() + 6)
+    def transition(new_state: AppState):
+        state["current"] = new_state
+        card.set_state(new_state)
+        if new_state == AppState.ENTRY:
+            screen_win.hide(); camera_win.hide(); subtitle_win.hide()
+        elif new_state == AppState.PRESCAN:
+            screen_win.hide(); camera_win.hide()
+            position_subtitle_below_card()
+            subtitle_win.show()
+        elif new_state == AppState.PRACTICE:
+            screen_win.hide(); camera_win.hide()
+            position_subtitle_below_card()
+            subtitle_win.show()
+            if subtitle_win._collapsed:
+                subtitle_win.toggle_collapsed()
+        elif new_state == AppState.RECORDING:
+            position_subtitle_below_card()
+            subtitle_win.show()
+            position_camera_beside_card()
+            camera_win.show()
+            # 屏幕框：自动定位到 Chrome 视频，否则放屏幕中央
+            bounds = detect_video_bounds()
+            if bounds:
+                vx, vy, vw, vh = bounds
+                print(f"视频检测成功: {vx},{vy}  {vw}×{vh}")
+                screen_win.position_on_video(vx, vy, vw, vh)
+            else:
+                sc = app.primaryScreen().geometry()
+                screen_win.move(sc.width()//2 - WIN_W//2,
+                                sc.height()//2 - screen_win.height()//2)
+            screen_win.show()
+        elif new_state == AppState.FINISHED:
+            screen_win.hide(); camera_win.hide()
 
-    screen_win.show()
-    camera_win.show()
+    # ── 状态转换回调 ─────────────────────────────────────────────────────
+    def do_start_prescan():
+        # 从 ENTRY/PRACTICE 进入 PRESCAN
+        transition(AppState.PRESCAN)
+        camera_win._start_prescan()
+
+    def do_stop_prescan():
+        # PRESCAN → 等待 drain → PRACTICE
+        card.set_busy("收尾中…")
+        camera_win._stop_prescan()
+
+    def on_prescan_saved(path: str):
+        # _finalize_prescan 完成后调用 → 加载到字幕区 → 进入 PRACTICE
+        subtitle_win.load_srt(path, auto_expand=False)
+        transition(AppState.PRACTICE)
+
+    def do_continue_last(path: str):
+        if path and os.path.exists(path):
+            subtitle_win.load_srt(path, auto_expand=False)
+            transition(AppState.PRACTICE)
+
+    def do_start_record():
+        transition(AppState.RECORDING)
+        camera_win._start()
+
+    def do_stop_record():
+        card.set_busy("正在保存…")
+        camera_win._stop()
+
+    def on_merge_done(ok: bool, path: str):
+        if ok:
+            state["last_video"] = path
+            card._last_video    = path
+        transition(AppState.FINISHED)
+
+    def do_record_again():
+        transition(AppState.PRACTICE)
+
+    def do_open_video():
+        if state["last_video"]:
+            subprocess.run(["open", state["last_video"]])
+
+    card.on_start_prescan = do_start_prescan
+    card.on_stop_prescan  = do_stop_prescan
+    card.on_continue_last = do_continue_last
+    card.on_start_record  = do_start_record
+    card.on_stop_record   = do_stop_record
+    card.on_record_again  = do_record_again
+    card.on_open_video    = do_open_video
+
+    camera_win.on_prescan_saved = on_prescan_saved
+    camera_win._merge_sig.done.connect(on_merge_done)
+
+    # 控制卡片定位 — 屏幕中央
+    sc = app.primaryScreen().geometry()
+    card.move(sc.width()//2 - card.width()//2, sc.height()//2 - card.height()//2)
+    card.show()
+
     sys.exit(app.exec())
