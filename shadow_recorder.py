@@ -708,11 +708,21 @@ class CameraWindow(QWidget):
         self.cam_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cam_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
-        # REC 按钮
+        # REC 按钮（停止后复用为"✓ 保存"）
         self.rec_btn = QPushButton("● REC", self)
         self.rec_btn.setFixedSize(96, 36)
-        self.rec_btn.clicked.connect(self._toggle_recording)
+        self.rec_btn.clicked.connect(self._btn_clicked)
         self._style_rec(False)
+
+        # 重录按钮（仅 review 阶段可见）
+        self.rerecord_btn = QPushButton("↩ 重录", self)
+        self.rerecord_btn.setFixedSize(86, 36)
+        self.rerecord_btn.setStyleSheet(
+            "QPushButton{color:#ccc;background:#444;border:none;"
+            "border-radius:18px;font-size:13px;}"
+            "QPushButton:hover{background:#555;}")
+        self.rerecord_btn.clicked.connect(self._do_rerecord)
+        self.rerecord_btn.hide()
 
         # 关闭按钮
         self.close_btn = QPushButton("✕", self)
@@ -722,7 +732,7 @@ class CameraWindow(QWidget):
             "QPushButton:hover{color:#fff;background:rgba(180,0,0,180);border-radius:14px;}")
         self.close_btn.clicked.connect(QApplication.quit)
 
-        # 状态标签（保存进度）
+        # 状态标签
         self.status_label = QLabel("", self)
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -737,13 +747,17 @@ class CameraWindow(QWidget):
         self.sct = mss.MSS()
 
         # 录制状态
-        self.recording    = False
-        self._vid_writer  = None
-        self._tmp_video   = None
-        self._tmp_sys     = None
-        self._tmp_mic     = None
-        self._rec_sys     = None   # SystemAudioRecorder（ScreenCaptureKit）
-        self._rec_mic     = None   # AudioRecorder（麦克风）
+        self.recording     = False
+        self._reviewing    = False   # 停止后等待保存/重录决策
+        self._vid_writer   = None
+        self._tmp_video    = None
+        self._tmp_sys      = None
+        self._tmp_mic      = None
+        self._rec_sys      = None   # SystemAudioRecorder（ScreenCaptureKit）
+        self._rec_mic      = None   # AudioRecorder（麦克风）
+        self._held_sys_wav = None   # _stop_and_hold 后保留的系统音频路径
+        self._held_mic_wav = None   # _stop_and_hold 后保留的麦克风路径
+        self._video_scale  = 1.0    # 时间戳缩放比
 
         # 连接字幕 → SRT 记录
         self._prev_sub    = ""
@@ -790,9 +804,16 @@ class CameraWindow(QWidget):
     def _layout(self):
         ch = self._ch
         self.cam_label.setGeometry(0, 0, WIN_W, ch)
-        self.rec_btn.move(WIN_W//2 - 48, ch - 46)
         self.close_btn.move(WIN_W - 34, 6)
         self.status_label.setGeometry(0, ch - 68, WIN_W, 18)
+        if self.rerecord_btn.isVisible():
+            gap   = 8
+            total = self.rerecord_btn.width() + gap + self.rec_btn.width()
+            x0    = (WIN_W - total) // 2
+            self.rerecord_btn.move(x0, ch - 46)
+            self.rec_btn.move(x0 + self.rerecord_btn.width() + gap, ch - 46)
+        else:
+            self.rec_btn.move(WIN_W//2 - 48, ch - 46)
 
     def resizeEvent(self, e):
         self._layout(); super().resizeEvent(e)
@@ -853,9 +874,13 @@ class CameraWindow(QWidget):
                     pass
 
     # ── 录制控制 ──────────────────────────────────────────────────────────
-    def _toggle_recording(self):
-        if self.recording: self._stop()
-        else:              self._start()
+    def _btn_clicked(self):
+        if self.recording:
+            self._stop_and_hold()
+        elif self._reviewing:
+            self._do_save()
+        else:
+            self._start()
 
     def _start(self):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -892,54 +917,113 @@ class CameraWindow(QWidget):
         self.status_label.setText("")
         self.update()
 
-    def _stop(self):
+    def _stop_and_hold(self):
+        """停止录制，保留临时文件，进入 review 状态（用户决策保存或重录）。"""
         self.recording = False
-        # 立刻记录停止时刻：_vid_writer.release / _rec_sys.stop 会耗时，
-        # 若在它们之后再算 elapsed 会把等待时间计入，导致 itsscale 偏大、视频偏慢
         _stop_t = self._last_frame_time or time.time()
         self.screen_win.set_recording(False)
         self._style_rec(False)
         self.rec_btn.setEnabled(False)
-        self.status_label.setText("⏳ 正在保存...")
+        self.status_label.setText("")
         self.update()
 
-        # 停止视频
         if self._vid_writer:
             self._vid_writer.release()
             self._vid_writer = None
 
-        # 停止系统音频（Swift 进程写 .caf 文件）
-        sys_wav = None
+        self._held_sys_wav = None
         if self._rec_sys:
             self._rec_sys.stop()
             if os.path.exists(self._tmp_sys) and os.path.getsize(self._tmp_sys) > 0:
-                sys_wav = self._tmp_sys
+                self._held_sys_wav = self._tmp_sys
             self._rec_sys = None
 
-        # 停止麦克风并保存 WAV
-        mic_wav = None
+        self._held_mic_wav = None
         if self._rec_mic:
             if self._rec_mic.stop_and_save(self._tmp_mic):
-                mic_wav = self._tmp_mic
+                self._held_mic_wav = self._tmp_mic
             self._rec_mic = None
 
-        # 写 SRT 字幕文件
-        self._write_srt()
-
-        # 计算视频时间戳缩放比：cv2 写入器以 30fps 标签时长，但实际录制帧率往往更低
-        video_scale = 1.0
+        self._video_scale = 1.0
         if self._frames_written > 0 and self._rec_t0:
-            elapsed     = _stop_t - self._rec_t0   # 用录制停止瞬间的时刻，不含后续清理耗时
+            elapsed     = _stop_t - self._rec_t0
             nominal_dur = self._frames_written / 30.0
             if nominal_dur > 0:
-                video_scale = elapsed / nominal_dur
+                self._video_scale = elapsed / nominal_dur
                 print(f"[视频] 写入 {self._frames_written} 帧 / {elapsed:.2f}s "
                       f"= {self._frames_written/elapsed:.1f} fps "
-                      f"(itsscale={video_scale:.3f})")
+                      f"(itsscale={self._video_scale:.3f})")
 
-        # 后台合并
-        merge_and_save(self._tmp_video, sys_wav, mic_wav,
-                       self._final_out, self._merge_sig, video_scale)
+        if self._frames_written == 0:
+            # 没有有效帧，直接丢弃
+            self._discard_temp()
+            self.rec_btn.setEnabled(True)
+        else:
+            self._enter_review()
+
+    def _enter_review(self):
+        """显示"重录 / 保存"操作区，等待用户决策。"""
+        self._reviewing = True
+        self.rec_btn.setText("✓ 保存")
+        self.rec_btn.setStyleSheet(
+            "QPushButton{color:white;background:#22aa66;border:none;"
+            "border-radius:18px;font-size:13px;font-weight:bold;}"
+            "QPushButton:hover{background:#33bb77;}"
+            "QPushButton:pressed{background:#119955;}")
+        # 保存按钮延迟启用：防止按 STOP 时鼠标未松开、切换后 mouseRelease 误触"保存"
+        self.rec_btn.setEnabled(False)
+        self.rerecord_btn.show()
+        self._layout()
+        self.status_label.setText("留还是重来？")
+        self.status_label.setStyleSheet("color:#aaa;font-size:10px;background:transparent;")
+        self.update()
+        QTimer.singleShot(400, self._enable_save_btn)
+
+    def _enable_save_btn(self):
+        if self._reviewing:
+            self.rec_btn.setEnabled(True)
+
+    def _exit_review(self):
+        """退出 review 状态，恢复 REC 按钮。"""
+        self._reviewing = False
+        self.rerecord_btn.hide()
+        self._style_rec(False)
+        self._layout()
+        self.update()
+
+    def _do_rerecord(self):
+        """丢弃本次录制，直接准备重录。"""
+        self._discard_temp()
+        self._exit_review()
+        self.status_label.setText("")
+        self.status_label.setStyleSheet("color:#888;font-size:10px;background:transparent;")
+
+    def _discard_temp(self):
+        """删除所有临时录制文件，重置状态。"""
+        for f in [self._tmp_video, self._held_sys_wav, self._held_mic_wav]:
+            if f and os.path.exists(f):
+                try: os.remove(f)
+                except: pass
+        self._tmp_video    = None
+        self._tmp_sys      = None
+        self._tmp_mic      = None
+        self._held_sys_wav = None
+        self._held_mic_wav = None
+        self._srt_data     = []
+        self._rec_t0       = None
+        self._frames_written = 0
+        self._final_out    = None
+        self._srt_out      = None
+
+    def _do_save(self):
+        """写 SRT + 启动后台 ffmpeg 合并。"""
+        self.rec_btn.setEnabled(False)
+        self.rerecord_btn.setEnabled(False)
+        self.status_label.setText("⏳ 正在保存…")
+        self.status_label.setStyleSheet("color:#888;font-size:10px;background:transparent;")
+        self._write_srt()
+        merge_and_save(self._tmp_video, self._held_sys_wav, self._held_mic_wav,
+                       self._final_out, self._merge_sig, self._video_scale)
 
     def _record_srt_entry(self, text: str):
         """由 ScreenWindow.on_subtitle_srt 回调，仅在录制期间记录。"""
@@ -974,14 +1058,11 @@ class CameraWindow(QWidget):
         print(f"[SRT] {self._srt_out}  ({count} 条)")
 
     def _on_merge_done(self, ok: bool, path: str):
-        self.rec_btn.setEnabled(True)
+        self.rerecord_btn.setEnabled(True)
+        self._exit_review()
         if ok:
-            name     = os.path.basename(path)
-            srt_name = os.path.basename(self._srt_out)
-            self.status_label.setText(f"✓ 已保存至 screentest/")
-            self.status_label.setStyleSheet("color:#44cc88;font-size:10px;background:transparent;")
             print(f"[保存] 视频: {path}")
-            print(f"[保存] 字幕: {self._srt_out}")
+            self.status_label.setText("✓ 已保存至 screentest/")
             self.status_label.setStyleSheet("color:#44cc88;font-size:10px;background:transparent;")
         else:
             self.status_label.setText("⚠ 合并失败，检查 ffmpeg")
@@ -1056,8 +1137,11 @@ class CameraWindow(QWidget):
 
     def closeEvent(self, e):
         self.timer.stop()
-        if self.recording: self._stop()
-        if self.cap.isOpened(): self.cap.release()
+        if self.recording:
+            self._stop_and_hold()
+        self._discard_temp()
+        if self.cap.isOpened():
+            self.cap.release()
         e.accept()
 
 
