@@ -268,8 +268,10 @@ def merge_and_save(tmp_video, sys_wav, mic_wav, output, signals: MergeSignals,
             cmd += in_opts + ['-i', path]
         if fcomp:
             cmd += ['-filter_complex', fcomp]
+        # -shortest: 以最短流（视频）为准截断，消除 ScreenCaptureKit stop 后的音频尾段
         cmd += maps + meta + disp + ['-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
-                                      '-pix_fmt', 'yuv420p', '-c:a', 'aac', output]
+                                      '-pix_fmt', 'yuv420p', '-c:a', 'aac',
+                                      '-shortest', output]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         ok = result.returncode == 0
@@ -485,6 +487,18 @@ class ScreenWindow(QWidget):
         self._res_ch0   = 0
 
         self.on_ch_changed = None
+        self._collapsed    = False
+        self.on_collapse_changed = None   # callback(collapsed: bool)
+
+        # 折叠按钮（顶栏最左）
+        self._fold_btn = QPushButton("—", self)
+        self._fold_btn.setFixedSize(18, 16)
+        self._fold_btn.move(4, 4)
+        self._fold_btn.setStyleSheet(
+            "QPushButton{color:#555;background:transparent;border:none;font-size:11px;}"
+            "QPushButton:hover{color:#aaa;}")
+        self._fold_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._fold_btn.clicked.connect(self._toggle_collapse)
 
         # ── 字幕卡片 ──────────────────────────────────────────────────────
         self.on_subtitle_srt = None   # callback(text) 供 CameraWindow 记录 SRT
@@ -525,10 +539,26 @@ class ScreenWindow(QWidget):
         ch = max(MIN_CH, min(MAX_CH, ch))
         if ch == self._ch: return
         self._ch = ch
-        self.resize(WIN_W, ch + TOPBAR + HANDLE)
+        if not self._collapsed:
+            self.resize(WIN_W, ch + TOPBAR + HANDLE)
         self.update()
         if emit and self.on_ch_changed:
             self.on_ch_changed(ch)
+
+    # ── 折叠 / 展开 ──────────────────────────────────────────────────────
+    def _toggle_collapse(self):
+        if self._collapsed:
+            self._collapsed = False
+            self._fold_btn.setText("—")
+            self.resize(WIN_W, self._ch + TOPBAR + HANDLE)
+        else:
+            self._collapsed = True
+            self._fold_btn.setText("＋")
+            self._subtitle_card.clear()
+            self.resize(WIN_W, TOPBAR)
+        self.update()
+        if self.on_collapse_changed:
+            self.on_collapse_changed(self._collapsed)
 
     def set_recording(self, on: bool):
         self._recording = on
@@ -592,40 +622,53 @@ class ScreenWindow(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         h = self.height()
         blink_on = self._recording and self._blink
         clr = QColor("#ff3333") if blink_on else QColor("#00aaff")
 
-        p.fillRect(0, 0, WIN_W, TOPBAR, QColor(0, 0, 0, 185))
-        p.setPen(QPen(clr, BORDER)); p.setBrush(Qt.BrushStyle.NoBrush)
-        b = BORDER // 2
-        p.drawRect(b, b, WIN_W - BORDER, h - BORDER)
+        if self._collapsed:
+            # 折叠态：只画一条圆角 pill，不画内容框和 handle
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 200))
+            p.drawRoundedRect(0, 0, WIN_W, TOPBAR, 6, 6)
+            p.setFont(QFont("Helvetica", 9))
+            p.setPen(QColor("#555"))
+            p.drawText(28, 15, f"录屏区  {WIN_W}×{self._ch}")
+            if blink_on:
+                p.setPen(QColor("#ff4444"))
+                p.setFont(QFont("Helvetica", 9, QFont.Weight.Bold))
+                p.drawText(WIN_W - 100, 15, "⏺  REC")
+        else:
+            p.fillRect(0, 0, WIN_W, TOPBAR, QColor(0, 0, 0, 185))
+            p.setPen(QPen(clr, BORDER)); p.setBrush(Qt.BrushStyle.NoBrush)
+            b = BORDER // 2
+            p.drawRect(b, b, WIN_W - BORDER, h - BORDER)
 
-        mk = 14; p.setPen(QPen(clr, 2))
-        for x, y, dx, dy in [(b,b,1,1),(WIN_W-b,b,-1,1),(b,h-b,1,-1),(WIN_W-b,h-b,-1,-1)]:
-            p.drawLine(x, y, x+dx*mk, y); p.drawLine(x, y, x, y+dy*mk)
+            mk = 14; p.setPen(QPen(clr, 2))
+            for x, y, dx, dy in [(b,b,1,1),(WIN_W-b,b,-1,1),(b,h-b,1,-1),(WIN_W-b,h-b,-1,-1)]:
+                p.drawLine(x, y, x+dx*mk, y); p.drawLine(x, y, x, y+dy*mk)
 
-        p.fillRect(0, h-HANDLE, WIN_W, HANDLE, QColor(28, 28, 28, 220))
-        cx = WIN_W // 2
-        p.setPen(QColor(95, 95, 95))
-        for off in (-12, 0, 12):
-            p.drawLine(cx+off-5, h-6, cx+off+5, h-6)
+            p.fillRect(0, h-HANDLE, WIN_W, HANDLE, QColor(28, 28, 28, 220))
+            cx = WIN_W // 2
+            p.setPen(QColor(95, 95, 95))
+            for off in (-12, 0, 12):
+                p.drawLine(cx+off-5, h-6, cx+off+5, h-6)
 
-        # 顶栏：尺寸 + 系统音频状态
-        p.setFont(QFont("Helvetica", 9))
-        p.setPen(QColor("#777"))
-        p.drawText(8, 16, f"录屏区  {WIN_W}×{self._ch}")
-        if blink_on:
-            p.setPen(QColor("#ff4444"))
-            p.setFont(QFont("Helvetica", 9, QFont.Weight.Bold))
-            p.drawText(WIN_W - 140, 16, "⏺  REC")
+            p.setFont(QFont("Helvetica", 9))
+            p.setPen(QColor("#777"))
+            p.drawText(28, 16, f"录屏区  {WIN_W}×{self._ch}")
+            if blink_on:
+                p.setPen(QColor("#ff4444"))
+                p.setFont(QFont("Helvetica", 9, QFont.Weight.Bold))
+                p.drawText(WIN_W - 140, 16, "⏺  REC")
         p.end()
 
     def mousePressEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton: return
         ly = e.position().toPoint().y()
         gp = e.globalPosition().toPoint()
-        if ly >= self.height() - HANDLE:
+        if not self._collapsed and ly >= self.height() - HANDLE:
             self._resizing = True; self._res_y0 = gp.y(); self._res_ch0 = self._ch
         else:
             self._resizing          = False
@@ -634,7 +677,8 @@ class ScreenWindow(QWidget):
 
     def mouseMoveEvent(self, e):
         ly = e.position().toPoint().y()
-        self.setCursor(Qt.CursorShape.SizeVerCursor if ly >= self.height()-HANDLE
+        in_handle = not self._collapsed and ly >= self.height() - HANDLE
+        self.setCursor(Qt.CursorShape.SizeVerCursor if in_handle
                        else Qt.CursorShape.OpenHandCursor)
         if e.buttons() != Qt.MouseButton.LeftButton: return
         gp = e.globalPosition().toPoint()
@@ -840,7 +884,8 @@ class CameraWindow(QWidget):
         self._rec_mic = AudioRecorder(self.mic_idx)
         self._rec_mic.start()
 
-        self._rec_t0 = time.time()
+        self._rec_t0          = time.time()
+        self._last_frame_time = None   # 最后一帧写入时刻，用于精准计算 itsscale
         self.recording = True
         self.screen_win.set_recording(True)
         self._style_rec(True)
@@ -849,6 +894,9 @@ class CameraWindow(QWidget):
 
     def _stop(self):
         self.recording = False
+        # 立刻记录停止时刻：_vid_writer.release / _rec_sys.stop 会耗时，
+        # 若在它们之后再算 elapsed 会把等待时间计入，导致 itsscale 偏大、视频偏慢
+        _stop_t = self._last_frame_time or time.time()
         self.screen_win.set_recording(False)
         self._style_rec(False)
         self.rec_btn.setEnabled(False)
@@ -881,7 +929,7 @@ class CameraWindow(QWidget):
         # 计算视频时间戳缩放比：cv2 写入器以 30fps 标签时长，但实际录制帧率往往更低
         video_scale = 1.0
         if self._frames_written > 0 and self._rec_t0:
-            elapsed     = time.time() - self._rec_t0
+            elapsed     = _stop_t - self._rec_t0   # 用录制停止瞬间的时刻，不含后续清理耗时
             nominal_dur = self._frames_written / 30.0
             if nominal_dur > 0:
                 video_scale = elapsed / nominal_dur
@@ -978,7 +1026,8 @@ class CameraWindow(QWidget):
                 if cam_bgr.shape[0] != cch:
                     cam_bgr = cover(cam_bgr, WIN_W, cch)
                 self._vid_writer.write(np.vstack([scr_bgr, cam_bgr]))
-                self._frames_written += 1
+                self._frames_written   += 1
+                self._last_frame_time   = time.time()
             except Exception as ex:
                 print(f"[record] {ex}")
 
@@ -1064,7 +1113,9 @@ if __name__ == "__main__":
     # 高度联动 — 改完高度后把摄像区移到录屏区正下方，避免独立窗口位置不同步导致重叠/分离
     def _relayout_cam_below_scr():
         sp = screen_win.pos()
-        camera_win.move(sp.x(), sp.y() + screen_win.height() + 6)
+        # screen_win._ch 是 set_content_h 里已同步更新的值，
+        # 直接用它算偏移，避免 macOS 下 resize() 后 height() 返回旧值导致位置偏差
+        camera_win.move(sp.x(), sp.y() + screen_win._ch + TOPBAR + HANDLE + 6)
 
     def _on_scr_ch(ch):
         camera_win.set_content_h(TOTAL_H - ch, emit=False)
@@ -1076,6 +1127,15 @@ if __name__ == "__main__":
 
     screen_win.on_ch_changed = _on_scr_ch
     camera_win.on_ch_changed = _on_cam_ch
+
+    def _on_collapse(collapsed):
+        if collapsed:
+            camera_win.hide()
+        else:
+            camera_win.show()
+            _relayout_cam_below_scr()
+
+    screen_win.on_collapse_changed = _on_collapse
 
     # 定位
     bounds = detect_video_bounds()
