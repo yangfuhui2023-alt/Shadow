@@ -7,14 +7,27 @@ Shadow Recorder
 输出：shadow_时间戳.mp4（450×800，含两条独立音轨）
 首次运行需在「系统设置 → 隐私 → 屏幕录制」中授权。
 """
-import sys, cv2, numpy as np, subprocess, threading, wave, os, time, atexit, signal
+import sys, cv2, numpy as np, subprocess, threading, wave, os, time, atexit, signal, shutil, tempfile
 from datetime import datetime
 
-SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
-SWIFT_BIN     = os.path.join(SCRIPT_DIR, "audio_capture")
-SUBTITLE_BIN  = os.path.join(SCRIPT_DIR, "subtitle_recognizer")
-OUTPUT_DIR    = os.path.join(SCRIPT_DIR, "screentest")
+if getattr(sys, 'frozen', False):
+    # PyInstaller .app bundle：Swift 二进制在 Contents/Frameworks/Shadow/
+    _contents  = os.path.dirname(os.path.dirname(sys.executable))
+    _SWIFT_DIR = os.path.join(_contents, 'Frameworks', 'Shadow')
+    OUTPUT_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'Shadow')
+else:
+    _SWIFT_DIR = os.path.dirname(os.path.abspath(__file__))
+    OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'screentest')
+
+SWIFT_BIN    = os.path.join(_SWIFT_DIR, "audio_capture")
+SUBTITLE_BIN = os.path.join(_SWIFT_DIR, "subtitle_recognizer")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# 临时文件目录：bundle 只读，统一写 /tmp
+_TMPDIR = tempfile.gettempdir()
+
+# ffmpeg：打包后 .app 的 PATH 不含 Homebrew，需显式查找
+_FFMPEG = shutil.which("ffmpeg", path=os.environ.get("PATH","") + ":/opt/homebrew/bin:/usr/local/bin") or "ffmpeg"
 
 import sounddevice as sd
 
@@ -263,7 +276,7 @@ def merge_and_save(tmp_video, sys_wav, mic_wav, output, signals: MergeSignals,
                 disp += [f'-disposition:a:{ai}', '0']
             ai   += 1
 
-        cmd = ['ffmpeg', '-y']
+        cmd = [_FFMPEG, '-y']
         for path, in_opts in inputs:
             cmd += in_opts + ['-i', path]
         if fcomp:
@@ -273,8 +286,12 @@ def merge_and_save(tmp_video, sys_wav, mic_wav, output, signals: MergeSignals,
                                       '-pix_fmt', 'yuv420p', '-c:a', 'aac',
                                       '-shortest', output]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        ok = result.returncode == 0
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            ok = result.returncode == 0
+        except Exception as e:
+            print(f"[ffmpeg] 启动失败: {e}")
+            ok = False
 
         for f in [tmp_video, sys_wav, mic_wav]:
             if f and os.path.exists(f):
@@ -883,10 +900,10 @@ class CameraWindow(QWidget):
             self._start()
 
     def _start(self):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._tmp_video = f"_tmp_video_{ts}.mp4"
-        self._tmp_sys   = f"_tmp_sys_{ts}.caf"   # ScreenCaptureKit 输出 CAF
-        self._tmp_mic   = f"_tmp_mic_{ts}.wav"
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        self._tmp_video = os.path.join(_TMPDIR, f"_tmp_video_{ts}.mp4")
+        self._tmp_sys   = os.path.join(_TMPDIR, f"_tmp_sys_{ts}.caf")
+        self._tmp_mic   = os.path.join(_TMPDIR, f"_tmp_mic_{ts}.wav")
         self._final_out = os.path.join(OUTPUT_DIR, f"shadow_{ts}.mp4")
         self._srt_out   = os.path.join(OUTPUT_DIR, f"shadow_{ts}.srt")
         self._srt_data  = []   # [(start_sec, end_sec, text)]
@@ -924,42 +941,58 @@ class CameraWindow(QWidget):
         self.screen_win.set_recording(False)
         self._style_rec(False)
         self.rec_btn.setEnabled(False)
-        self.status_label.setText("")
+        self.status_label.setText("停止中…")
         self.update()
 
-        if self._vid_writer:
-            self._vid_writer.release()
-            self._vid_writer = None
+        # 快照后立即置 None，后台线程接管阻塞操作，UI 线程不等待
+        vid_writer     = self._vid_writer;  self._vid_writer = None
+        rec_sys        = self._rec_sys;     self._rec_sys    = None
+        rec_mic        = self._rec_mic;     self._rec_mic    = None
+        tmp_sys        = self._tmp_sys
+        tmp_mic        = self._tmp_mic
+        frames_written = self._frames_written
+        rec_t0         = self._rec_t0
 
-        self._held_sys_wav = None
-        if self._rec_sys:
-            self._rec_sys.stop()
-            if os.path.exists(self._tmp_sys) and os.path.getsize(self._tmp_sys) > 0:
-                self._held_sys_wav = self._tmp_sys
-            self._rec_sys = None
+        def _do_stop():
+            if vid_writer:
+                vid_writer.release()
 
-        self._held_mic_wav = None
-        if self._rec_mic:
-            if self._rec_mic.stop_and_save(self._tmp_mic):
-                self._held_mic_wav = self._tmp_mic
-            self._rec_mic = None
+            held_sys_wav = None
+            if rec_sys:
+                rec_sys.stop()
+                if os.path.exists(tmp_sys) and os.path.getsize(tmp_sys) > 0:
+                    held_sys_wav = tmp_sys
 
-        self._video_scale = 1.0
-        if self._frames_written > 0 and self._rec_t0:
-            elapsed     = _stop_t - self._rec_t0
-            nominal_dur = self._frames_written / 30.0
-            if nominal_dur > 0:
-                self._video_scale = elapsed / nominal_dur
-                print(f"[视频] 写入 {self._frames_written} 帧 / {elapsed:.2f}s "
-                      f"= {self._frames_written/elapsed:.1f} fps "
-                      f"(itsscale={self._video_scale:.3f})")
+            held_mic_wav = None
+            if rec_mic:
+                if rec_mic.stop_and_save(tmp_mic):
+                    held_mic_wav = tmp_mic
 
-        if self._frames_written == 0:
-            # 没有有效帧，直接丢弃
-            self._discard_temp()
-            self.rec_btn.setEnabled(True)
-        else:
-            self._enter_review()
+            video_scale = 1.0
+            if frames_written > 0 and rec_t0:
+                elapsed     = _stop_t - rec_t0
+                nominal_dur = frames_written / 30.0
+                if nominal_dur > 0:
+                    video_scale = elapsed / nominal_dur
+                    print(f"[视频] 写入 {frames_written} 帧 / {elapsed:.2f}s "
+                          f"= {frames_written/elapsed:.1f} fps "
+                          f"(itsscale={video_scale:.3f})")
+
+            self._held_sys_wav = held_sys_wav
+            self._held_mic_wav = held_mic_wav
+            self._video_scale  = video_scale
+
+            if frames_written == 0:
+                QTimer.singleShot(0, self._discard_and_reenable)
+            else:
+                QTimer.singleShot(0, self._enter_review)
+
+        threading.Thread(target=_do_stop, daemon=True).start()
+
+    def _discard_and_reenable(self):
+        self._discard_temp()
+        self.rec_btn.setEnabled(True)
+        self.status_label.setText("")
 
     def _enter_review(self):
         """显示"重录 / 保存"操作区，等待用户决策。"""
