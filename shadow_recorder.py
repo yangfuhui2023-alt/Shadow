@@ -7,7 +7,7 @@ Shadow Recorder
 输出：shadow_时间戳.mp4（450×800，含两条独立音轨）
 首次运行需在「系统设置 → 隐私 → 屏幕录制」中授权。
 """
-import sys, cv2, numpy as np, subprocess, threading, wave, os, time, atexit, signal, shutil, tempfile
+import sys, cv2, numpy as np, subprocess, threading, wave, os, time, atexit, signal, shutil, tempfile, queue
 from datetime import datetime
 
 if getattr(sys, 'frozen', False):
@@ -41,6 +41,8 @@ import mss
 
 WIN_W   = 450
 TOTAL_H = 800
+OUT_W   = 720   # 输出视频宽度（高于 UI 窗口，提升摄像画质）
+OUT_H   = 1280  # 输出视频高度（9:16 标准竖屏）
 INIT_CH = 400
 MIN_CH  = 100
 MAX_CH  = 700
@@ -66,7 +68,8 @@ def cover(frame_bgr: np.ndarray, tw: int, th: int) -> np.ndarray:
     fh, fw = frame_bgr.shape[:2]
     scale  = max(tw / fw, th / fh)
     nw, nh = int(fw * scale + 0.5), int(fh * scale + 0.5)
-    r = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LANCZOS4
+    r = cv2.resize(frame_bgr, (nw, nh), interpolation=interp)
     x0, y0 = (nw - tw) // 2, (nh - th) // 2
     return r[y0:y0+th, x0:x0+tw]
 
@@ -282,7 +285,7 @@ def merge_and_save(tmp_video, sys_wav, mic_wav, output, signals: MergeSignals,
         if fcomp:
             cmd += ['-filter_complex', fcomp]
         # -shortest: 以最短流（视频）为准截断，消除 ScreenCaptureKit stop 后的音频尾段
-        cmd += maps + meta + disp + ['-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+        cmd += maps + meta + disp + ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
                                       '-pix_fmt', 'yuv420p', '-c:a', 'aac',
                                       '-shortest', output]
 
@@ -758,6 +761,8 @@ class CameraWindow(QWidget):
 
         # 设备
         self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.sct = mss.MSS()
         self._cam_fail_count = 0  # 连续读取失败帧数，用于权限授权后自动重连
 
@@ -773,6 +778,8 @@ class CameraWindow(QWidget):
         self._held_sys_wav = None   # _stop_and_hold 后保留的系统音频路径
         self._held_mic_wav = None   # _stop_and_hold 后保留的麦克风路径
         self._video_scale  = 1.0    # 时间戳缩放比
+        self._write_queue  = None
+        self._writer_thread = None
 
         # 合并信号
         self._merge_sig = MergeSignals()
@@ -894,15 +901,28 @@ class CameraWindow(QWidget):
 
     def _start(self):
         ts = datetime.now().strftime("%Y%m%d_%H%M")
-        self._tmp_video = os.path.join(_TMPDIR, f"_tmp_video_{ts}.mp4")
+        self._tmp_video = os.path.join(_TMPDIR, f"_tmp_video_{ts}.avi")
         self._tmp_sys   = os.path.join(_TMPDIR, f"_tmp_sys_{ts}.caf")
         self._tmp_mic   = os.path.join(_TMPDIR, f"_tmp_mic_{ts}.wav")
         self._final_out = os.path.join(OUTPUT_DIR, f"shadow_{ts}.mp4")
         self._rec_t0    = None # 录制起始时间
         self._frames_written = 0
 
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self._vid_writer = cv2.VideoWriter(self._tmp_video, fourcc, 30, (WIN_W, TOTAL_H))
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        self._vid_writer = cv2.VideoWriter(self._tmp_video, fourcc, 30, (OUT_W, OUT_H))
+
+        # 异步写帧：采集线程只入队，独立 worker 线程负责磁盘写入，避免 I/O 阻塞帧率
+        self._vid_writer.set(cv2.VIDEOWRITER_PROP_QUALITY, 95)
+        self._write_queue  = queue.Queue(maxsize=30)
+        _vw = self._vid_writer
+        def _frame_writer():
+            while True:
+                item = self._write_queue.get()
+                if item is None:
+                    break
+                _vw.write(item)
+        self._writer_thread = threading.Thread(target=_frame_writer, daemon=True)
+        self._writer_thread.start()
 
         # 系统音频（ScreenCaptureKit）
         self._rec_sys = SystemAudioRecorder()
@@ -936,15 +956,21 @@ class CameraWindow(QWidget):
         self.update()
 
         # 快照后立即置 None，后台线程接管阻塞操作，UI 线程不等待
-        vid_writer     = self._vid_writer;  self._vid_writer = None
-        rec_sys        = self._rec_sys;     self._rec_sys    = None
-        rec_mic        = self._rec_mic;     self._rec_mic    = None
+        vid_writer     = self._vid_writer;    self._vid_writer = None
+        write_queue    = self._write_queue;   self._write_queue = None
+        writer_thread  = self._writer_thread; self._writer_thread = None
+        rec_sys        = self._rec_sys;       self._rec_sys    = None
+        rec_mic        = self._rec_mic;       self._rec_mic    = None
         tmp_sys        = self._tmp_sys
         tmp_mic        = self._tmp_mic
         frames_written = self._frames_written
         rec_t0         = self._rec_t0
 
         def _do_stop():
+            # 先排空写帧队列，再 release，保证所有帧都落盘
+            if write_queue and writer_thread:
+                write_queue.put(None)
+                writer_thread.join(timeout=10)
             if vid_writer:
                 vid_writer.release()
 
@@ -1077,17 +1103,24 @@ class CameraWindow(QWidget):
         cam_bgr = None
         if ret:
             self._cam_fail_count = 0
-            cam_bgr = cover(cv2.flip(frame, 1), WIN_W, self._ch)
+            # 按 Retina devicePixelRatio 渲染，避免 2x 屏幕上的马赛克感
+            dpr   = self.devicePixelRatio()
+            dw, dh = int(WIN_W * dpr), int(self._ch * dpr)
+            cam_bgr = cover(cv2.flip(frame, 1), dw, dh)
             rgb = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
             h, w, c = rgb.shape
-            self.cam_label.setPixmap(
-                QPixmap.fromImage(QImage(rgb.data, w, h, w*c, QImage.Format.Format_RGB888)))
+            img = QImage(rgb.data, w, h, w * c, QImage.Format.Format_RGB888)
+            pix = QPixmap.fromImage(img)
+            pix.setDevicePixelRatio(dpr)
+            self.cam_label.setPixmap(pix)
         else:
             self._cam_fail_count += 1
             # 每 ~2 秒（60 帧）尝试重新打开摄像头，处理授权后不刷新的情况
             if self._cam_fail_count % 60 == 0:
                 self.cap.release()
                 self.cap = cv2.VideoCapture(0)
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
         if self.recording and self._vid_writer and cam_bgr is not None:
             try:
@@ -1096,12 +1129,18 @@ class CameraWindow(QWidget):
                 raw     = np.frombuffer(shot.raw, dtype=np.uint8).reshape(
                               (shot.height, shot.width, 4))
                 sch     = self.screen_win.content_h
+                # 屏幕区按比例缩放到输出宽度
+                sch_out = round(sch * OUT_W / WIN_W)
                 scr_bgr = cv2.resize(cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR),
-                                     (WIN_W, sch), interpolation=cv2.INTER_AREA)
-                cch = TOTAL_H - sch
-                if cam_bgr.shape[0] != cch:
-                    cam_bgr = cover(cam_bgr, WIN_W, cch)
-                self._vid_writer.write(np.vstack([scr_bgr, cam_bgr]))
+                                     (OUT_W, sch_out), interpolation=cv2.INTER_LANCZOS4)
+                cch_out = OUT_H - sch_out
+                # 摄像区直接从原始帧（翻转）覆盖到输出尺寸，比从缩小后的 cam_bgr 保留更多细节
+                cam_bgr = cover(cv2.flip(frame, 1), OUT_W, cch_out)
+                combined = np.vstack([scr_bgr, cam_bgr])
+                try:
+                    self._write_queue.put_nowait(combined)
+                except queue.Full:
+                    pass  # writer 来不及时丢帧，优先保证采集流畅
                 self._frames_written   += 1
                 self._last_frame_time   = time.time()
             except Exception as ex:
