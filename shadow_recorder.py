@@ -759,6 +759,7 @@ class CameraWindow(QWidget):
         # 设备
         self.cap = cv2.VideoCapture(0)
         self.sct = mss.MSS()
+        self._cam_fail_count = 0  # 连续读取失败帧数，用于权限授权后自动重连
 
         # 录制状态
         self.recording     = False
@@ -1075,11 +1076,18 @@ class CameraWindow(QWidget):
         ret, frame = self.cap.read()
         cam_bgr = None
         if ret:
+            self._cam_fail_count = 0
             cam_bgr = cover(cv2.flip(frame, 1), WIN_W, self._ch)
             rgb = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
             h, w, c = rgb.shape
             self.cam_label.setPixmap(
                 QPixmap.fromImage(QImage(rgb.data, w, h, w*c, QImage.Format.Format_RGB888)))
+        else:
+            self._cam_fail_count += 1
+            # 每 ~2 秒（60 帧）尝试重新打开摄像头，处理授权后不刷新的情况
+            if self._cam_fail_count % 60 == 0:
+                self.cap.release()
+                self.cap = cv2.VideoCapture(0)
 
         if self.recording and self._vid_writer and cam_bgr is not None:
             try:
