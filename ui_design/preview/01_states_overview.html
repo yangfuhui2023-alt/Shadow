@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Shadow · Ghost UI v2</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #2a2a2a;
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
+    color: #fff;
+    padding: 60px 40px;
+    background-image: radial-gradient(ellipse at 20% 50%, rgba(60,80,100,0.4) 0%, transparent 60%),
+                      radial-gradient(ellipse at 80% 20%, rgba(40,60,90,0.3) 0%, transparent 50%);
+  }
+
+  .page-label {
+    text-align: center;
+    font-size: 11px;
+    color: rgba(255,255,255,0.2);
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    margin-bottom: 14px;
+    font-weight: 400;
+  }
+  .compare-note {
+    text-align: center;
+    max-width: 480px;
+    margin: 0 auto 50px;
+    font-size: 11px;
+    color: rgba(255,255,255,0.2);
+    line-height: 1.7;
+  }
+
+  .states-row {
+    display: flex;
+    gap: 40px;
+    justify-content: center;
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .state-group {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+  }
+  .state-label {
+    font-size: 10px;
+    color: rgba(255,255,255,0.2);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+
+  /* ══════════════════════════════════
+     工具本体 — 无外层 chrome，仅上下录制区
+     ══════════════════════════════════ */
+  .tool {
+    width: 230px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;          /* 上下录制区之间留缝 */
+    /* 容器本身透明，无边框无背景 */
+  }
+
+  /* ── 通用录制区 ── */
+  .zone {
+    position: relative;
+    overflow: hidden;
+    border-radius: 3px;
+    background: rgba(0,0,0,0.22);
+  }
+  .zone-screen { height: 130px; }
+  .zone-camera { height: 168px; }
+
+  .video-bg {
+    width: 100%; height: 100%;
+    background: linear-gradient(160deg, rgba(70,90,115,0.6) 0%, rgba(30,45,65,0.9) 100%);
+    background-color: #1e2d3d;
+  }
+  .camera-bg {
+    width: 100%; height: 100%;
+    background:
+      radial-gradient(ellipse at 50% 26%, rgba(255,210,160,0.28) 0%, transparent 55%),
+      linear-gradient(180deg, rgba(70,55,45,0.92) 0%, rgba(38,30,24,0.98) 55%, rgba(24,19,15,1) 100%);
+  }
+
+  /* 人物头肩剪影 */
+  .silhouette { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); width: 108px; height: 108px; }
+  .sil-head { width: 46px; height: 52px; border-radius: 50% 50% 46% 46%; background: rgba(255,255,255,0.12); margin: 0 auto; }
+  .sil-shoulder { width: 108px; height: 56px; border-radius: 54px 54px 0 0; background: rgba(255,255,255,0.12); margin-top: 7px; }
+
+  /* ── 四角线框 ── */
+  .corner {
+    position: absolute; width: 11px; height: 11px;
+    border-color: rgba(255,255,255,0.38); border-style: solid;
+    pointer-events: none; z-index: 4;
+  }
+  .corner.tl { top: 4px; left: 4px;  border-width: 1.5px 0 0 1.5px; }
+  .corner.tr { top: 4px; right: 4px; border-width: 1.5px 1.5px 0 0; }
+  .corner.bl { bottom: 4px; left: 4px;  border-width: 0 0 1.5px 1.5px; }
+  .corner.br { bottom: 4px; right: 4px; border-width: 0 1.5px 1.5px 0; }
+
+  /* 录制中：四角微亮呼吸 */
+  .zone.rec .corner {
+    border-color: rgba(255,255,255,0.55);
+    animation: cornerPulse 2s ease-in-out infinite;
+  }
+  @keyframes cornerPulse {
+    0%, 100% { border-color: rgba(255,255,255,0.55); }
+    50%       { border-color: rgba(255,255,255,0.22); }
+  }
+
+  /* ══════════════════════════════════
+     区内功能 icon / 标签
+     ══════════════════════════════════ */
+
+  /* 字幕开关 — 录屏区右上 */
+  .chip-caption {
+    position: absolute; top: 6px; right: 6px; z-index: 6;
+    display: flex; align-items: center; gap: 4px;
+    font-size: 9px; color: rgba(255,255,255,0.5);
+    background: rgba(0,0,0,0.28);
+    border: 0.5px solid rgba(255,255,255,0.14);
+    border-radius: 6px; padding: 3px 7px; cursor: pointer;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    transition: all 0.2s;
+  }
+  .chip-caption:hover { color: rgba(255,255,255,0.8); background: rgba(0,0,0,0.4); }
+  .chip-caption.on { color: #fff; border-color: rgba(255,255,255,0.3); }
+  .cc-icon {
+    width: 13px; height: 9px; border-radius: 2px;
+    border: 1px solid currentColor;
+    display: flex; align-items: center; justify-content: center;
+    gap: 1.5px;
+  }
+  .cc-icon i { width: 3px; height: 1.5px; background: currentColor; border-radius: 1px; }
+
+  /* 状态标 — 录屏区左上（尺寸 / 录制中计时） */
+  .status-tag {
+    position: absolute; top: 7px; left: 8px; z-index: 6;
+    display: flex; align-items: center; gap: 5px;
+    font-size: 9px; color: rgba(255,255,255,0.4);
+    letter-spacing: 0.3px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.4);
+  }
+  .status-tag.live { color: rgba(255,255,255,0.7); }
+  .st-dot {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: #FF3B30;
+    animation: dotPulse 1.2s ease-in-out infinite;
+  }
+  @keyframes dotPulse { 0%,100%{opacity:1;} 50%{opacity:0.2;} }
+
+  /* ── 倒计时大数字 ── */
+  .countdown-overlay {
+    position: absolute; inset: 0; z-index: 5;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.3);
+    backdrop-filter: blur(2px);
+  }
+  .countdown-num {
+    font-size: 58px; font-weight: 200;
+    color: rgba(255,255,255,0.9); letter-spacing: -3px; line-height: 1;
+  }
+
+  /* ══════════════════════════════════
+     操作按钮 — 浮在摄像头区底部内侧
+     ══════════════════════════════════ */
+  .cam-actions {
+    position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 7;
+    display: flex; align-items: center; gap: 8px;
+  }
+
+  .btn {
+    display: flex; align-items: center; gap: 6px;
+    border: none; cursor: pointer;
+    font-weight: 500; white-space: nowrap;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    transition: all 0.15s ease;
+  }
+
+  /* 主按钮：白 */
+  .btn-primary {
+    background: rgba(255,255,255,0.90); color: #111;
+    border-radius: 18px; padding: 8px 20px; font-size: 12px;
+    box-shadow: 0 3px 14px rgba(0,0,0,0.35);
+  }
+  .btn-primary:hover { background: rgba(255,255,255,0.99); transform: translateY(-1px); }
+  .btn-primary:active { transform: scale(0.96) translateY(1px); }
+
+  /* 次按钮：深磨砂 */
+  .btn-ghost {
+    background: rgba(15,15,15,0.45); color: rgba(255,255,255,0.9);
+    border: 0.5px solid rgba(255,255,255,0.22);
+    border-radius: 18px; padding: 8px 18px; font-size: 12px;
+    box-shadow: 0 3px 14px rgba(0,0,0,0.4);
+  }
+  .btn-ghost:hover { background: rgba(15,15,15,0.6); transform: translateY(-1px); }
+  .btn-ghost:active { transform: scale(0.96) translateY(1px); }
+
+  /* 完成态按钮（方角） */
+  .btn-square {
+    border-radius: 9px; padding: 9px 18px; font-size: 12px;
+  }
+
+  .rec-circle { width: 6px; height: 6px; border-radius: 50%; background: #FF3B30; flex-shrink: 0; }
+  .stop-sq { width: 7px; height: 7px; border-radius: 1.5px; background: rgba(255,255,255,0.7); flex-shrink: 0; }
+
+  /* ══════════════════════════════════
+     收起态 — 胶囊
+     ══════════════════════════════════ */
+  .capsule {
+    width: 56px; height: 28px;
+    border-radius: 14px;
+    cursor: pointer;
+    background: rgba(255,255,255,0.07);
+    border: 0.5px solid rgba(255,255,255,0.13);
+    box-shadow: 0 4px 18px rgba(0,0,0,0.3), inset 0 0.5px 0 rgba(255,255,255,0.2);
+    backdrop-filter: blur(16px);
+    display: flex; align-items: center; justify-content: center;
+    position: relative; overflow: hidden;
+  }
+  .capsule::before {
+    content: ''; position: absolute; top: 0; left: -100%;
+    width: 60%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.10), transparent);
+    animation: capsuleShimmer 3s ease-in-out infinite;
+  }
+  @keyframes capsuleShimmer { 0%{left:-100%;} 50%,100%{left:150%;} }
+  .cap-dots { display: flex; gap: 4px; align-items: center; }
+  .cap-dot { width: 4px; height: 4px; border-radius: 50%; background: rgba(255,255,255,0.25); }
+  .cap-dot:nth-child(2) { background: rgba(255,255,255,0.45); transform: scale(1.2); }
+
+  .section-divider {
+    text-align: center;
+    font-size: 10px;
+    color: rgba(255,255,255,0.12);
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    margin: 56px 0 40px;
+  }
+</style>
+</head>
+<body>
+
+<div class="page-label">Shadow · Ghost UI · v2</div>
+<div class="compare-note">
+  无外层窗口边框：只保留上下两个录制区的线框<br>
+  字幕、录制等所有功能 icon 全部收进录制区内部
+</div>
+
+<!-- 收起态 -->
+<div class="states-row">
+  <div class="state-group">
+    <div class="state-label">收起</div>
+    <div class="capsule">
+      <div class="cap-dots">
+        <div class="cap-dot"></div><div class="cap-dot"></div><div class="cap-dot"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section-divider">展开状态 · · ·</div>
+
+<div class="states-row">
+
+  <!-- 待机 -->
+  <div class="state-group">
+    <div class="state-label">待机</div>
+    <div class="tool">
+      <!-- 录屏区 -->
+      <div class="zone zone-screen">
+        <div class="video-bg"></div>
+        <div class="status-tag">450 × 400</div>
+        <div class="chip-caption">
+          <div class="cc-icon"><i></i><i></i></div>字幕
+        </div>
+      </div>
+      <!-- 摄像头区 -->
+      <div class="zone zone-camera">
+        <div class="camera-bg"></div>
+        <div class="silhouette"><div class="sil-head"></div><div class="sil-shoulder"></div></div>
+        <div class="cam-actions">
+          <button class="btn btn-primary"><div class="rec-circle"></div>开始录制</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 倒计时 -->
+  <div class="state-group">
+    <div class="state-label">倒计时</div>
+    <div class="tool">
+      <div class="zone zone-screen">
+        <div class="video-bg"></div>
+        <div class="chip-caption"><div class="cc-icon"><i></i><i></i></div>字幕</div>
+        <div class="countdown-overlay"><div class="countdown-num">3</div></div>
+      </div>
+      <div class="zone zone-camera">
+        <div class="camera-bg"></div>
+        <div class="silhouette"><div class="sil-head"></div><div class="sil-shoulder"></div></div>
+        <div class="cam-actions">
+          <button class="btn btn-ghost">取消</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 录制中 -->
+  <div class="state-group">
+    <div class="state-label">录制中</div>
+    <div class="tool">
+      <div class="zone zone-screen rec">
+        <div class="video-bg"></div>
+        <div class="status-tag live"><div class="st-dot"></div>00:32</div>
+        <div class="chip-caption on"><div class="cc-icon"><i></i><i></i></div>字幕</div>
+      </div>
+      <div class="zone zone-camera rec">
+        <div class="camera-bg"></div>
+        <div class="silhouette"><div class="sil-head"></div><div class="sil-shoulder"></div></div>
+        <div class="cam-actions">
+          <button class="btn btn-ghost"><div class="stop-sq"></div>停止</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 完成 -->
+  <div class="state-group">
+    <div class="state-label">完成</div>
+    <div class="tool">
+      <div class="zone zone-screen">
+        <div class="video-bg"></div>
+        <div class="status-tag">已录制 1:14</div>
+        <div class="chip-caption"><div class="cc-icon"><i></i><i></i></div>字幕</div>
+      </div>
+      <div class="zone zone-camera">
+        <div class="camera-bg"></div>
+        <div class="silhouette"><div class="sil-head"></div><div class="sil-shoulder"></div></div>
+        <div class="cam-actions">
+          <button class="btn btn-ghost btn-square">重录</button>
+          <button class="btn btn-primary btn-square">保存视频</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
