@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Shadow · 分离录制区 · 雾化适应</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a1a;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    color: #fff;
+    padding: 48px 40px 80px;
+    display: flex; flex-direction: column; align-items: center;
+  }
+  .page-title { font-size: 10px; color: rgba(255,255,255,0.15); letter-spacing: 3px; text-transform: uppercase; text-align: center; margin-bottom: 14px; }
+  .page-sub { font-size: 11px; color: rgba(255,255,255,0.28); text-align: center; margin-bottom: 14px; line-height: 1.7; }
+  .hint { font-size: 10px; color: rgba(255,255,255,0.4); text-align: center; margin-bottom: 32px; }
+  .hint b { color: rgba(255,255,255,0.7); font-weight: 500; }
+
+  /* 桌面 */
+  .desktop {
+    width: 680px; height: 460px;
+    border-radius: 10px; overflow: hidden; position: relative;
+    background:
+      radial-gradient(ellipse at 22% 78%, rgba(30,55,85,0.85) 0%, transparent 55%),
+      radial-gradient(ellipse at 80% 16%, rgba(20,45,75,0.7)  0%, transparent 55%),
+      linear-gradient(155deg, #1a2d42 0%, #0d1a28 55%, #081018 100%);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+    user-select: none;
+  }
+  .menubar { position: absolute; top: 0; left: 0; right: 0; height: 18px; background: rgba(0,0,0,0.25); backdrop-filter: blur(8px); display: flex; align-items: center; gap: 12px; padding: 0 12px; z-index: 1; }
+  .mb-item { width: 18px; height: 5px; border-radius: 2px; background: rgba(255,255,255,0.12); }
+  .mb-right { margin-left: auto; display: flex; gap: 8px; }
+  .desk-icon { position: absolute; width: 34px; height: 34px; border-radius: 8px; background: rgba(255,255,255,0.05); border: 0.5px solid rgba(255,255,255,0.06); z-index: 1; }
+  .dock-bar { position: absolute; bottom: 5px; left: 50%; transform: translateX(-50%); width: 160px; height: 18px; background: rgba(255,255,255,0.05); border: 0.5px solid rgba(255,255,255,0.07); border-radius: 9px; z-index: 1; }
+
+  /* ── 可拖拽录制区窗口 ── */
+  .win {
+    position: absolute; overflow: hidden; cursor: move;
+    border: 1px solid rgba(255,255,255,0.5);
+    border-radius: 3px; z-index: 10;          /* 录制区内容层（盖住雾） */
+    transition: border-color 0.5s ease;
+  }
+  /* 录制中：白线框消失 */
+  .desktop.recording .win { border-color: transparent; }
+  .win.is-dragging { cursor: grabbing; }
+
+  /* 独立雾层（z5，在所有录制区内容之下）
+     → 重叠/相邻部分被录制区盖住，不显雾；只有两区之外的桌面才显雾 */
+  .win-fog {
+    position: absolute; border-radius: 3px; z-index: 5;
+    pointer-events: none; opacity: 0;
+    transition: opacity 0.5s ease;
+  }
+  .desktop.recording .win-fog {
+    opacity: 1;
+    box-shadow:
+      0 0 20px 3px rgba(255,255,255,0.17),
+      0 0 52px 14px rgba(255,255,255,0.10);
+  }
+  .desktop.recording .win-fog.is-dragging {
+    box-shadow:
+      0 0 24px 4px rgba(255,255,255,0.20),
+      0 0 60px 16px rgba(255,255,255,0.12);
+  }
+
+  .video-bg {
+    width: 100%; height: 100%;
+    background:
+      radial-gradient(ellipse at 38% 42%, rgba(95,125,165,0.55) 0%, transparent 55%),
+      linear-gradient(175deg, #2c4264 0%, #16222f 60%, #0a1520 100%);
+  }
+  .camera-bg {
+    width: 100%; height: 100%; position: relative;
+    background:
+      radial-gradient(ellipse at 50% 24%, rgba(255,210,160,0.30) 0%, transparent 55%),
+      linear-gradient(180deg, rgba(70,55,45,0.95) 0%, rgba(40,32,26,0.98) 55%, rgba(25,20,16,1) 100%);
+  }
+  .silhouette { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); width: 120px; height: 120px; }
+  .sil-head { width: 52px; height: 60px; border-radius: 50% 50% 46% 46%; background: rgba(255,255,255,0.13); margin: 0 auto; box-shadow: inset 0 4px 8px rgba(255,255,255,0.06); }
+  .sil-shoulder { width: 120px; height: 64px; border-radius: 60px 60px 0 0; background: rgba(255,255,255,0.13); margin-top: 7px; }
+
+  /* 区角标签 */
+  .win-tag {
+    position: absolute; top: 6px; left: 8px; z-index: 5;
+    font-size: 9px; color: rgba(255,255,255,0.45); letter-spacing: 0.5px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+    transition: opacity 0.4s;
+  }
+  .desktop.recording .win-tag { opacity: 0; }
+  .rec-badge {
+    position: absolute; top: 6px; left: 8px; z-index: 6;
+    display: flex; align-items: center; gap: 5px;
+    font-size: 9px; color: rgba(255,255,255,0.65); letter-spacing: 0.5px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+    opacity: 0; transition: opacity 0.5s ease 0.3s;
+  }
+  .rb-dot { width: 5px; height: 5px; border-radius: 50%; background: #FF3B30; animation: rbPulse 1.2s ease-in-out infinite; }
+  @keyframes rbPulse { 0%,100%{opacity:1;} 50%{opacity:0.2;} }
+  .desktop.recording .rec-badge { opacity: 1; }
+
+  /* 录制按钮（在摄像头窗口底部内侧） */
+  .cam-btn-zone {
+    position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 20; cursor: default;
+  }
+  .action-btn {
+    display: flex; align-items: center; gap: 6px; border: none;
+    border-radius: 19px; padding: 8px 20px; font-size: 12px; font-weight: 500;
+    cursor: pointer; transition: all 0.15s ease; white-space: nowrap;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  .btn-rec-action { background: rgba(255,255,255,0.9); color: #111; box-shadow: 0 3px 16px rgba(0,0,0,0.4); }
+  .btn-rec-action:hover { background: #fff; transform: translateY(-1px); }
+  .btn-stop-action { background: rgba(15,15,15,0.5); border: 0.5px solid rgba(255,255,255,0.28); color: rgba(255,255,255,0.92); display: none; box-shadow: 0 3px 16px rgba(0,0,0,0.45); }
+  .btn-stop-action:hover { background: rgba(15,15,15,0.65); transform: translateY(-1px); }
+  .act-dot { width: 6px; height: 6px; border-radius: 50%; background: #FF3B30; }
+  .act-sq  { width: 6px; height: 6px; border-radius: 1.5px; background: rgba(255,255,255,0.75); }
+
+  .desc { margin-top: 28px; font-size: 11px; color: rgba(255,255,255,0.3); line-height: 2; text-align: center; max-width: 560px; }
+  .desc b { color: rgba(255,255,255,0.55); font-weight: 500; }
+</style>
+</head>
+<body>
+
+<div class="page-title">Shadow · Detached Zones · Fog Adaptation</div>
+<div class="page-sub">特殊情况：录屏区与摄像头区独立拖拽到桌面任意位置</div>
+<div class="hint">拖动任一窗口移动位置 · 点击 <b>开始录制</b> 看雾化如何适应</div>
+
+<div class="desktop" id="desk">
+  <div class="menubar"><div class="mb-item"></div><div class="mb-right"><div class="mb-item"></div><div class="mb-item"></div></div></div>
+  <div class="desk-icon" style="top:30px;right:20px;"></div>
+  <div class="desk-icon" style="top:74px;right:20px;"></div>
+  <div class="dock-bar"></div>
+
+  <!-- 录屏区窗口（可拖） -->
+  <div class="win" id="winScreen" style="left:70px; top:60px; width:190px; height:148px;">
+    <div class="video-bg"></div>
+    <div class="win-tag">录屏区</div>
+    <div class="rec-badge"><div class="rb-dot"></div>录制中</div>
+  </div>
+
+  <!-- 摄像头窗口（可拖） -->
+  <div class="win" id="winCam" style="left:400px; top:230px; width:180px; height:178px;">
+    <div class="camera-bg"><div class="silhouette"><div class="sil-head"></div><div class="sil-shoulder"></div></div></div>
+    <div class="win-tag">摄像头</div>
+    <div class="rec-badge"><div class="rb-dot"></div>录制中</div>
+    <div class="cam-btn-zone">
+      <button class="action-btn btn-rec-action" id="btnRec">开始录制</button>
+      <button class="action-btn btn-stop-action" id="btnStop"><div class="act-sq"></div>停止</button>
+    </div>
+  </div>
+</div>
+
+<div class="desc">
+  每个录制区<b>各自带一圈独立雾环</b>，跟随窗口位置移动。<br>
+  两区<b>靠近</b>时雾自然叠加、中间连成一片；<b>拉远</b>时各自雾向外渐淡消失，中间桌面露出。<br>
+  原则不变：录制区内清晰，贴边非录制区雾化，远处完全漏出画面。
+</div>
+
+<script>
+  const desk = document.getElementById('desk');
+
+  /* ── 窗口拖拽 ── */
+  function makeDraggable(win) {
+    // 为窗口创建独立雾层（底层 z5），跟随窗口位置/大小
+    const fog = document.createElement('div');
+    fog.className = 'win-fog';
+    desk.insertBefore(fog, win);
+    function syncFog() {
+      fog.style.left   = win.offsetLeft + 'px';
+      fog.style.top    = win.offsetTop + 'px';
+      fog.style.width  = win.offsetWidth + 'px';
+      fog.style.height = win.offsetHeight + 'px';
+    }
+    syncFog();
+
+    let ox = 0, oy = 0, dragging = false;
+    win.addEventListener('mousedown', e => {
+      // 点到按钮区不触发拖拽
+      if (e.target.closest('.cam-btn-zone')) return;
+      dragging = true;
+      const wr = win.getBoundingClientRect();
+      ox = e.clientX - wr.left;
+      oy = e.clientY - wr.top;
+      win.style.zIndex = 15;
+      win.classList.add('is-dragging');
+      fog.classList.add('is-dragging');
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', e => {
+      if (!dragging) return;
+      const dr = desk.getBoundingClientRect();
+      let x = e.clientX - dr.left - ox;
+      let y = e.clientY - dr.top - oy;
+      // 限制在桌面内
+      x = Math.max(0, Math.min(dr.width  - win.offsetWidth,  x));
+      y = Math.max(18, Math.min(dr.height - win.offsetHeight, y));
+      win.style.left = x + 'px';
+      win.style.top  = y + 'px';
+      syncFog();
+    });
+    document.addEventListener('mouseup', () => {
+      dragging = false; win.style.zIndex = 10;
+      win.classList.remove('is-dragging');
+      fog.classList.remove('is-dragging');
+    });
+  }
+  makeDraggable(document.getElementById('winScreen'));
+  makeDraggable(document.getElementById('winCam'));
+
+  /* ── 录制切换 ── */
+  document.getElementById('btnRec').addEventListener('click', e => {
+    e.stopPropagation();
+    desk.classList.add('recording');
+    document.getElementById('btnRec').style.display = 'none';
+    document.getElementById('btnStop').style.display = 'flex';
+  });
+  document.getElementById('btnStop').addEventListener('click', e => {
+    e.stopPropagation();
+    desk.classList.remove('recording');
+    document.getElementById('btnRec').style.display = 'flex';
+    document.getElementById('btnStop').style.display = 'none';
+  });
+</script>
+
+</body>
+</html>

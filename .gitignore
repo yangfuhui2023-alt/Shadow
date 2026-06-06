@@ -12,6 +12,10 @@ ocr_frame
 # 录制输出目录
 screentest/
 
+# 打包产物（PyInstaller 中间产物 + 生成的 .app / DMG）
+build/
+dist/
+
 # 评测运行时报告
 eval_report_*.txt
 
