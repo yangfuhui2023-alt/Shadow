@@ -42,8 +42,12 @@ final class AudioWriter: @unchecked Sendable {
                 writer.startWriting()
                 // 以首帧 PTS 作为会话起点：跨多次录制复用进程时，时间戳更稳，
                 // 输出文件从 0 开始，避免前导静音/偏移。
-                writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(buf))
+                let pts = CMSampleBufferGetPresentationTimeStamp(buf)
+                writer.startSession(atSourceTime: pts)
                 started = true
+                // 首帧 host-clock 时刻（秒）：供父进程对齐音画。音频与视频同用
+                // CMClockGetHostTimeClock，二者之差即真实的采集起始偏移。
+                fputs("AEPOCH \(CMTimeGetSeconds(pts))\n", stderr)
             }
             if input.isReadyForMoreMediaData { input.append(buf) }
         }
@@ -255,6 +259,8 @@ final class VideoRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let pts = CMSampleBufferGetPresentationTimeStamp(buf)
         if !started {
             aw.startWriting(); aw.startSession(atSourceTime: pts); started = true
+            // 首帧 host-clock 时刻（秒），与 AEPOCH 同一时钟，供父进程对齐音画。
+            fputs("VEPOCH \(CMTimeGetSeconds(pts))\n", stderr)
         }
         if vinput.isReadyForMoreMediaData { adp.append(px, withPresentationTime: pts) }
     }

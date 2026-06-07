@@ -262,6 +262,8 @@ class SystemAudioDaemon:
         self.active  = False         # 当前是否在录制（音频）
         self.video_active = False    # 当前是否在抓屏（视频）
         self.error   = None
+        self.audio_epoch = None      # 系统音频首帧 host-clock 时刻（秒）
+        self.video_epoch = None      # 屏幕画面首帧 host-clock 时刻（秒，同一时钟）
 
     def _ensure_proc(self) -> bool:
         if self._proc and self._proc.poll() is None:
@@ -286,7 +288,14 @@ class SystemAudioDaemon:
         # 把关心的事件行推入队列，其余（stream stopped 等）丢弃，顺便防 stderr 阻塞
         for line in proc.stderr:
             line = line.strip()
-            if line in ("READY", "SAVED", "VREADY", "VSAVED") or line.startswith(("ERROR", "TIP")):
+            # 首帧时刻不进事件队列（_wait_for 会把非匹配行丢弃），直接存到 self
+            if line.startswith("AEPOCH "):
+                try: self.audio_epoch = float(line.split()[1])
+                except Exception: pass
+            elif line.startswith("VEPOCH "):
+                try: self.video_epoch = float(line.split()[1])
+                except Exception: pass
+            elif line in ("READY", "SAVED", "VREADY", "VSAVED") or line.startswith(("ERROR", "TIP")):
                 evq.put(line)
 
     def _drain_events(self):
@@ -316,6 +325,7 @@ class SystemAudioDaemon:
         with self._lock:
             self.error  = None
             self.active = False
+            self.audio_epoch = None    # 复用进程：清掉上一轮的首帧时刻
             if not self._ensure_proc():
                 return
             self._drain_events()       # 清掉上一轮残留的 SAVED 等事件
@@ -352,6 +362,7 @@ class SystemAudioDaemon:
             if not self._ensure_proc():
                 return False
             self.video_active = False
+            self.video_epoch = None    # 复用进程：清掉上一轮的首帧时刻
             try:
                 self._proc.stdin.write(
                     f"VSTART {int(x)} {int(y)} {int(w)} {int(h)} {int(out_w)} {int(out_h)} {path}\n")
@@ -447,7 +458,7 @@ class MergeSignals(QObject):
 
 # ── ffmpeg 合并（后台线程） ────────────────────────────────────────────────────
 def merge_and_save(scr_video, cam_video, sys_wav, mic_wav, output, signals: MergeSignals,
-                   cam_scale: float = 1.0):
+                   cam_scale: float = 1.0, sys_audio_offset: float = 0.0):
     """录屏区视频（SCK，PTS 精准）置顶 + 摄像区视频（cv2，按 cam_scale 校正时长）置底，
     上下拼接成 9:16，再叠加系统音/麦克风。"""
     def _run():
@@ -461,11 +472,14 @@ def merge_and_save(scr_video, cam_video, sys_wav, mic_wav, output, signals: Merg
             inputs.append((cam_video, ['-itsscale', f'{cam_scale:.6f}']))
             cam_idx = len(inputs) - 1
 
-        audio_info = []    # [(input_idx, title)]
-        for wav, title in [(sys_wav, 'System Audio'), (mic_wav, 'Microphone')]:
-            if wav and os.path.exists(wav):
-                inputs.append((wav, []))
-                audio_info.append((len(inputs) - 1, title))
+        # 音频输入：不在输入级做偏移。系统音的延后在滤镜图内用 adelay 垫静音实现，
+        # 避免 amix 因等待“延后才到的”系统音而把麦克风也一起拖后（混音轨整体延迟）。
+        sys_in = mic_in = None
+        if sys_wav and os.path.exists(sys_wav):
+            inputs.append((sys_wav, [])); sys_in = len(inputs) - 1
+        if mic_wav and os.path.exists(mic_wav):
+            inputs.append((mic_wav, [])); mic_in = len(inputs) - 1
+        delay_ms = int(round(sys_audio_offset * 1000)) if sys_audio_offset and sys_audio_offset > 0 else 0
 
         filters = []
         # 视频：录屏区在上、摄像区在下，统一 30fps 后 vstack
@@ -484,23 +498,30 @@ def merge_and_save(scr_video, cam_video, sys_wav, mic_wav, output, signals: Merg
         maps = (['-map', vmap] if vmap else [])
         meta = []
         disp = []
-        ai   = 0
 
-        # 两路音频齐全时，合成一条默认混音轨（系统音 + 麦克风），原始两轨保留供剪辑
-        if len(audio_info) == 2:
-            a0, a1 = audio_info[0][0], audio_info[1][0]
-            filters.append(f"[{a0}:a][{a1}:a]amix=inputs=2:duration=longest[mixed]")
-            maps += ['-map', '[mixed]']
-            meta += [f'-metadata:s:a:{ai}', 'title=Mixed (System + Mic)']
-            disp += [f'-disposition:a:{ai}', 'default']
-            ai   += 1
-
-        for in_idx, title in audio_info:
-            maps += ['-map', f'{in_idx}:a']
-            meta += [f'-metadata:s:a:{ai}', f'title={title}']
-            if len(audio_info) == 2:
-                disp += [f'-disposition:a:{ai}', '0']
-            ai   += 1
+        if sys_in is not None and mic_in is not None:
+            # 系统音延后 delay_ms（adelay 垫前导静音）后一分为二：一路进混音、一路作独立轨。
+            # 麦克风不延后（其起始已≈画面）。混音从 0 起 ⇒ 麦克风不被拖后。
+            sd_pre = f"[{sys_in}:a]adelay={delay_ms}:all=1," if delay_ms > 0 else f"[{sys_in}:a]"
+            filters.append(f"{sd_pre}asplit=2[sa_mix][sa_out]")
+            filters.append(f"[{mic_in}:a]asplit=2[ma_mix][ma_out]")
+            filters.append("[sa_mix][ma_mix]amix=inputs=2:duration=longest[mixed]")
+            maps += ['-map', '[mixed]', '-map', '[sa_out]', '-map', '[ma_out]']
+            meta += ['-metadata:s:a:0', 'title=Mixed (System + Mic)',
+                     '-metadata:s:a:1', 'title=System Audio',
+                     '-metadata:s:a:2', 'title=Microphone']
+            disp += ['-disposition:a:0', 'default',
+                     '-disposition:a:1', '0', '-disposition:a:2', '0']
+        elif sys_in is not None:
+            if delay_ms > 0:
+                filters.append(f"[{sys_in}:a]adelay={delay_ms}:all=1[sa_out]")
+                maps += ['-map', '[sa_out]']
+            else:
+                maps += ['-map', f'{sys_in}:a']
+            meta += ['-metadata:s:a:0', 'title=System Audio']
+        elif mic_in is not None:
+            maps += ['-map', f'{mic_in}:a']
+            meta += ['-metadata:s:a:0', 'title=Microphone']
 
         cmd = [_FFMPEG, '-y']
         for path, in_opts in inputs:
@@ -1166,6 +1187,7 @@ class CameraWindow(QWidget):
         self._held_sys_wav = None   # _stop_and_hold 后保留的系统音频路径
         self._held_mic_wav = None   # _stop_and_hold 后保留的麦克风路径
         self._video_scale  = 1.0    # 时间戳缩放比
+        self._av_offset    = 0.0    # 系统音相对画面的延后量（秒），对齐口型
         self._write_queue  = None
         self._writer_thread = None
 
@@ -1489,10 +1511,22 @@ class CameraWindow(QWidget):
                           f"= {frames_written/elapsed:.1f} fps "
                           f"(itsscale={video_scale:.3f})")
 
+            # 音画对齐：系统音频与屏幕画面同用 host 时钟，首帧时刻之差即真实采集
+            # 起始偏移。系统音 START 先于视频 VSTART + SCK 首帧延迟 ⇒ 系统音超前画面，
+            # 合成时把系统音整体延后 av_offset 秒即可对上口型。麦克风在 VSTART 之后才
+            # 启动，与画面起始已基本同步，不施加偏移。
+            av_offset = 0.0
+            ae, ve = sys_daemon.audio_epoch, sys_daemon.video_epoch
+            if ae is not None and ve is not None:
+                av_offset = max(0.0, ve - ae)
+                print(f"[音画] 系统音首帧={ae:.3f}s 画面首帧={ve:.3f}s "
+                      f"→ 系统音延后 {av_offset:.3f}s 对齐画面")
+
             self._held_scr_video = held_scr_video
             self._held_sys_wav = held_sys_wav
             self._held_mic_wav = held_mic_wav
             self._video_scale  = video_scale
+            self._av_offset    = av_offset
 
             if frames_written == 0:
                 QTimer.singleShot(0, self._discard_and_reenable)
@@ -1570,7 +1604,8 @@ class CameraWindow(QWidget):
         self._save_progress_timer.start(1000)
         merge_and_save(self._held_scr_video, self._tmp_video,
                        self._held_sys_wav, self._held_mic_wav,
-                       self._final_out, self._merge_sig, self._video_scale)
+                       self._final_out, self._merge_sig, self._video_scale,
+                       self._av_offset)
 
     def _update_save_progress(self):
         elapsed = int(time.time() - self._save_t0)
