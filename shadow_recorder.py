@@ -1242,7 +1242,8 @@ class CameraWindow(QWidget):
         elif self.recording or self._counting or self._stopping:
             btns = [self.rec_btn]                             # ■ 停止 / ✕ 取消（收尾时禁用）
         else:
-            btns = [self.fold_btn, self.rec_btn, self.close_btn]  # ⌄ 收起 + ● 录制 + ✕ 关闭
+            btns = [self.rec_btn, self.close_btn]   # ● 录制 + ✕ 关闭（收回菜单栏）
+            # 缩略态（胶囊）已取消：收起统一走 X→菜单栏驻留，故不再放折叠按钮
         for b in (self.fold_btn, self.rec_btn, self.rerecord_btn, self.close_btn):
             b.setVisible(b in btns)
 
