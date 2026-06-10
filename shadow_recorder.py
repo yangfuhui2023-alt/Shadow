@@ -32,7 +32,7 @@ _FFMPEG = shutil.which("ffmpeg", path=os.environ.get("PATH","") + ":/opt/homebre
 import sounddevice as sd
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton,
-                              QInputDialog)
+                              QInputDialog, QSystemTrayIcon, QMenu)
 from PyQt6.QtCore    import QTimer, Qt, QPoint, QPointF, QSize, QObject, pyqtSignal, QRect, QRectF
 from PyQt6.QtGui     import (QImage, QPixmap, QPainter, QColor, QPen, QFont,
                               QFontMetrics, QPainterPath, QLinearGradient,
@@ -1139,7 +1139,8 @@ class CameraWindow(QWidget):
         self.close_btn.setIcon(self._ic_close); self.close_btn.setIconSize(isz)
         self.close_btn.setStyleSheet(ICON_CLOSE_QSS)
         self.close_btn.setCursor(_hand)
-        self.close_btn.clicked.connect(QApplication.quit)
+        self.on_close = None   # main 注入：收起回菜单栏（而非退出 app）
+        self.close_btn.clicked.connect(lambda: self.on_close and self.on_close())
 
         self._dock_rect = QRect()    # 控制条磨砂底（_layout 计算，paintEvent 绘制）
         self._style_rec(False)
@@ -1636,6 +1637,8 @@ class CameraWindow(QWidget):
 
     # ── 帧循环 ────────────────────────────────────────────────────────────
     def _tick(self):
+        if self.cap is None:      # 空闲态（已收起到菜单栏），无摄像头
+            return
         ret, frame = self.cap.read()
         cam_bgr = None
         if ret:
@@ -1719,6 +1722,30 @@ class CameraWindow(QWidget):
         else:
             self.move(self._drag_win_start + (gp - self._drag_global_start))
 
+    # ── 菜单栏常驻：空闲/激活切换 ───────────────────────────────────────────
+    def enter_idle(self):
+        """收起回菜单栏：停预览、释放摄像头（灭绿灯），省资源。
+        录制/倒计时/待保存等活动会话期间拒绝空闲，保护录制不丢。"""
+        if self.recording or self._counting or self._reviewing:
+            return False
+        self.timer.stop()
+        if self.cap is not None:
+            try: self.cap.release()
+            except Exception: pass
+            self.cap = None
+        self.hide()
+        return True
+
+    def enter_active(self):
+        """从菜单栏召唤：重开摄像头、恢复预览。"""
+        if self.cap is None:
+            self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self._cam_fail_count = 0
+        if not self.timer.isActive():
+            self.timer.start(33)
+
     def closeEvent(self, e):
         self.timer.stop()
         if self.recording:
@@ -1726,7 +1753,7 @@ class CameraWindow(QWidget):
         if self.fog_overlay:
             self.fog_overlay.hide()
         self._discard_temp()
-        if self.cap.isOpened():
+        if self.cap is not None and self.cap.isOpened():
             self.cap.release()
         e.accept()
 
@@ -1807,26 +1834,94 @@ if __name__ == "__main__":
         if collapsed:
             camera_win.hide()
         else:
+            # 缩略态展开 → 整体居中（无论从哪个入口展开：点胶囊/折叠键），
+            # 防止之前把摄像区拖到屏幕外后展开仍够不到关闭按钮。
             camera_win.show()
-            _relayout_cam_below_scr()
+            _center_session()
 
     screen_win.on_collapse_changed = _on_collapse
 
-    # 定位
-    bounds = detect_video_bounds()
-    sc     = app.primaryScreen().geometry()
-    if bounds:
-        vx, vy, vw, vh = bounds
-        print(f"视频检测成功: {vx},{vy}  {vw}×{vh}")
-        screen_win.position_on_video(vx, vy, vw, vh)
-        sp = screen_win.pos()
-        camera_win.move(sp.x(), sp.y() + screen_win.height() + 6)
-    else:
-        cx = sc.width()//2 - WIN_W//2
-        cy = max(0, sc.height()//2 - (screen_win.height() + 6 + camera_win.height())//2)
+    # ── 整体 UI 居中 ────────────────────────────────────────────────────────
+    def _center_session():
+        """把录屏区+摄像区整体摆到屏幕正中（修复被拖出屏幕够不到关闭按钮）。"""
+        sc = app.primaryScreen().geometry()
+        total_h = (screen_win._ch + TOPBAR + HANDLE) + 6 + \
+                  (camera_win._ch + TOPBAR + HANDLE)
+        cx = sc.x() + sc.width() // 2 - WIN_W // 2
+        cy = sc.y() + max(0, (sc.height() - total_h) // 2)
         screen_win.move(cx, cy)
-        camera_win.move(cx, cy + screen_win.height() + 6)
+        _relayout_cam_below_scr()        # 用 _ch 把摄像区贴到录屏区正下方
 
-    screen_win.show()
-    camera_win.show()
+    # ── 菜单栏常驻：召唤 / 收起 ──────────────────────────────────────────────
+    def summon():
+        """万能复位：无论当前是缩略态/驻留态/被拖出屏幕，一律回到
+        「就绪态 + 屏幕正中」——两区展开、摄像头开、整体居中、置顶。"""
+        if screen_win._collapsed:        # 缩略态 → 先展开（联动唤回摄像区）
+            screen_win._toggle_collapse()
+        camera_win.enter_active()        # 摄像头开 + 预览
+        _center_session()                # 整体居中
+        screen_win.show(); screen_win.raise_(); screen_win.activateWindow()
+        camera_win.show(); camera_win.raise_(); camera_win.activateWindow()
+
+    def collapse():
+        """关闭按钮：收起回菜单栏（录制/待保存期间拒绝，保护录制）。"""
+        if not camera_win.enter_idle():
+            return
+        screen_win.hide()
+        fog_overlay.hide()
+
+    camera_win.on_close = collapse
+
+    # 关掉浮窗不退出 app —— 常驻菜单栏，只有 Quit 才真退出
+    app.setQuitOnLastWindowClosed(False)
+
+    # ── 菜单栏图标 ──────────────────────────────────────────────────────────
+    # 用 App 图标（两只企鹅）的单色剪影作模板图标（mask）：macOS 会按深/浅色
+    # 菜单栏自动反色，和旁边那排系统单色图标统一风格，而不是塞个橙色 App 方块。
+    def _glyph_path():
+        base = getattr(sys, '_MEIPASS', None)
+        if base:                                   # 打包版：bundle 根目录
+            p = os.path.join(base, 'penguins_glyph.png')
+            if os.path.exists(p): return p
+        # 源码版：项目内 ui_design/
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'ui_design', 'penguins_glyph.png')
+        return p if os.path.exists(p) else None
+
+    def _make_tray_icon():
+        gp = _glyph_path()
+        if gp:
+            ic = QIcon(gp)
+            if not ic.isNull():
+                ic.setIsMask(True)   # 作为 macOS 模板图标自动适配菜单栏
+                return ic
+        # 兜底：画个圆点，确保菜单栏一定有图标
+        pm = QPixmap(22, 22); pm.fill(Qt.GlobalColor.transparent)
+        pr = QPainter(pm); pr.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pr.setPen(Qt.PenStyle.NoPen); pr.setBrush(QColor(0, 0, 0))
+        pr.drawEllipse(5, 5, 12, 12); pr.end()
+        ic = QIcon(pm); ic.setIsMask(True)
+        return ic
+
+    tray_icon = _make_tray_icon()
+
+    tray = QSystemTrayIcon(tray_icon, app)
+    tray.setToolTip("Shadow")
+    menu = QMenu()
+    act_rec = menu.addAction("打开 Shadow")
+    act_rec.triggered.connect(summon)
+    menu.addSeparator()
+    act_quit = menu.addAction("退出  Quit")
+    act_quit.triggered.connect(app.quit)
+    tray.setContextMenu(menu)
+    # 点击图标只弹出菜单（不直接展开）；展开由「打开 Shadow」触发
+    tray.show()
+
+    # 启动即展开到「就绪态 + 屏幕居中」，并通知用户可以使用了；
+    # 菜单栏企鹅图标同时常驻，方便之后多次召唤录制。
+    summon()
+    tray.showMessage("Shadow 已就绪",
+                     "可以开始录制了 — 之后点菜单栏企鹅图标 →「打开 Shadow」召唤",
+                     tray_icon, 4000)
+
     sys.exit(app.exec())

@@ -14,6 +14,7 @@ a = Analysis(
         (os.path.join(src, 'ocr_frame'),           'Shadow'),
     ],
     datas=[
+        (os.path.join(src, 'ui_design', 'penguins_glyph.png'), '.'),
         *collect_data_files('cv2'),
         *collect_data_files('PyQt6'),
     ],
@@ -71,7 +72,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='Shadow.app',
-    icon=None,
+    icon=os.path.join(src, 'Shadow.icns'),
     bundle_identifier='com.shadow.recorder',
     info_plist={
         'NSHighResolutionCapable': True,
@@ -79,7 +80,7 @@ app = BUNDLE(
         'NSScreenCaptureUsageDescription': 'Shadow 需要屏幕录制权限来捕获屏幕内容。',
         'NSSpeechRecognitionUsageDescription': 'Shadow 需要语音识别权限来生成实时字幕。',
         'NSCameraUsageDescription': 'Shadow 需要摄像头权限来录制您的画面。',
-        'LSUIElement': False,
+        'LSUIElement': True,
         'CFBundleShortVersionString': '1.0.0',
         'CFBundleVersion': '1.0.0',
         'CFBundleName': 'Shadow',
