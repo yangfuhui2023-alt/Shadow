@@ -1210,12 +1210,10 @@ class ControlBar(QWidget):
     """
     BTN_W, BTN_H, BTN_GAP, PAD, GRIP_W = 40, 34, 6, 7, 0   # GRIP_W=0：钉死不可拖,无把手
 
-    def __init__(self):
-        super().__init__()
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
-                            Qt.WindowType.WindowStaysOnTopHint)
+    def __init__(self, parent=None):
+        # 子控件(parent=摄像窗):长在摄像画面里,随摄像窗一起移动/置顶 ⇒ 无独立窗口的 z 轴竞争闪现
+        super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
 
         isz   = QSize(20, 20)
@@ -1256,12 +1254,7 @@ class ControlBar(QWidget):
         self.close_btn.clicked.connect(lambda: self.on_close and self.on_close())
 
         self.on_primary = self.on_rerecord = self.on_trim = self.on_close = None
-        self.anchor_fn  = None        # () -> 摄像区窗口全局 QRect，用于贴底锚定
-        self._pos_mode  = 'cam_bottom'  # 'cam_bottom'=贴摄像区底部居中 / 'corner'=屏幕左下角固定
-        self._user_pos  = False       # 用户拖动过 → 自由态，不再自动跟随
         self._dock_rect = QRect()
-        self._dragging  = False
-        self._drag_gp   = QPoint(); self._drag_wp = QPoint()
         self.set_stage('ready')
 
     # ── 阶段 → 图标集 + 定位模式 ─────────────────────────────────────────────
@@ -1284,13 +1277,8 @@ class ControlBar(QWidget):
             btns = [b, self.close_btn]
         for w in (self.primary_btn, self.rerecord_btn, self.trim_btn, self.close_btn):
             w.setVisible(w in btns)
-        # 录制/就绪/倒计时 = 贴摄像区底部居中；后处理(review) = 屏幕左下角固定。
-        mode = 'corner' if stage == 'review' else 'cam_bottom'
-        if mode != self._pos_mode:
-            self._pos_mode = mode
-            self._user_pos = False
         self._relayout(btns)
-        self.follow()      # 每次都重摆：摄像区缩放/移动时贴底跟随（corner 则固定左下）
+        self.follow()      # 重摆到摄像区底部居中(子控件,父=摄像窗)
 
     def _relayout(self, btns):
         gap, pad, grip = self.BTN_GAP, self.PAD, self.GRIP_W
@@ -1306,27 +1294,21 @@ class ControlBar(QWidget):
 
     def set_primary_enabled(self, on):  self.primary_btn.setEnabled(on)
     def set_rerecord_enabled(self, on): self.rerecord_btn.setEnabled(on)
-    def reset_detach(self):             self._user_pos = False
+    def reset_detach(self):             pass   # 子控件不再有自由态,留空兼容旧调用
 
     # ── 锚定 / 跟随 ─────────────────────────────────────────────────────────
     def follow(self):
-        """录制/就绪阶段钉死在摄像区底部、水平居中；后处理固定屏幕左下角。
-        固定不可拖（操作区=摄像区，控制条必须稳定在内、始终可见可点）。"""
-        scr = QApplication.primaryScreen().geometry()
+        """钉在摄像区底部、水平居中。子控件,坐标相对父(摄像窗);随摄像窗自动移动,
+        缩放时由摄像窗 _layout 调本方法重摆。"""
+        p = self.parentWidget()
+        if p is None:
+            return
         bw, bh = self.width(), self.height()
-        if self._pos_mode == 'corner':             # 后处理：屏幕左下角固定
-            self.move(scr.left() + 24, scr.bottom() - bh - 24)
-            return
-        if not self.anchor_fn:                      # 录制/就绪：贴摄像区底部
-            return
-        a = self.anchor_fn()
-        if a is None:
-            return
-        x = a.left() + (a.width() - bw) // 2        # 摄像区水平居中
-        y = a.bottom() - HANDLE - bh - 6            # 叠在画面内底部、把手之上
-        x = max(scr.left() + 4, min(x, scr.right() - bw - 4))
-        y = max(scr.top() + 4, min(y, scr.bottom() - bh - 4))
-        self.move(x, y)
+        ch = p.content_h if hasattr(p, 'content_h') else p.height()
+        x = (p.width() - bw) // 2          # 摄像区水平居中
+        y = ch - bh - 6                    # 画面内底部、把手(HANDLE)之上
+        self.move(max(0, x), max(0, y))
+        self.raise_()                      # 浮在摄像预览 cam_label 之上
 
     # ── 绘制 ────────────────────────────────────────────────────────────────
     def paintEvent(self, _):
@@ -2892,12 +2874,6 @@ class CameraWindow(QWidget):
                 self._last_vregion_t   = time.time()
 
     # ── 鼠标 ──────────────────────────────────────────────────────────────
-    def _keep_ctrl_on_top(self):
-        # 点击摄像区会被系统抬到最前、盖住控制条;延后一拍(系统抬完后)把控制条重新置顶,
-        # 消除"点一下控制条闪现"的 z 轴竞争。
-        if self.ctrl and self.ctrl.isVisible():
-            QTimer.singleShot(0, self.ctrl.raise_)
-
     def mousePressEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton: return
         ly = e.position().toPoint().y()
@@ -2908,10 +2884,6 @@ class CameraWindow(QWidget):
             self._resizing          = False
             self._drag_global_start = gp
             self._drag_win_start    = self.pos()
-        self._keep_ctrl_on_top()
-
-    def mouseReleaseEvent(self, e):
-        self._keep_ctrl_on_top()
 
     def mouseMoveEvent(self, e):
         ly = e.position().toPoint().y()
@@ -2924,8 +2896,7 @@ class CameraWindow(QWidget):
             self.set_content_h(self._res_ch0 + gp.y() - self._res_y0)
         else:
             self.move(self._drag_win_start + (gp - self._drag_global_start))
-            if self.ctrl:
-                self.ctrl.follow(); self.ctrl.raise_()   # 贴摄像区底部跟随 + 保持在画面之上
+            # 控制条是子控件,随摄像窗自动移动,无需手动跟随
 
     # ── 菜单栏常驻：空闲/激活切换 ───────────────────────────────────────────
     def enter_idle(self):
@@ -3017,18 +2988,12 @@ if __name__ == "__main__":
     camera_win.fog_overlay = fog_overlay
     screen_win.fog_overlay = fog_overlay
 
-    # 独立控制条（横排 icon 模块，脱离录制区、可拖动）
-    ctrl_bar = ControlBar()
+    # 控制条 = 摄像窗的子控件(钉在画面内底部,随窗移动/置顶,无独立窗口闪现)
+    ctrl_bar = ControlBar(camera_win)
     camera_win.ctrl = ctrl_bar
     ctrl_bar.on_primary  = camera_win._btn_clicked
     ctrl_bar.on_rerecord = camera_win._do_rerecord
     ctrl_bar.on_close    = lambda: camera_win.on_close and camera_win.on_close()
-
-    def _cam_rect():
-        """摄像区窗口的全局矩形（控制条贴其底边、水平居中）。"""
-        return QRect(camera_win.x(), camera_win.y(),
-                     camera_win.width(), camera_win.height())
-    ctrl_bar.anchor_fn  = _cam_rect
 
     # 裁切编辑页（桌面正中弹出）
     editor_panel = EditorPanel()
