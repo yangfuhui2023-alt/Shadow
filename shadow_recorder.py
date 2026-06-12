@@ -1208,7 +1208,7 @@ class ControlBar(QWidget):
       直到 reset_detach()（召唤/居中）复位；
     · 状态机仍在 CameraWindow，靠 set_stage() 驱动本条显示哪些图标。
     """
-    BTN_W, BTN_H, BTN_GAP, PAD, GRIP_W = 40, 34, 6, 7, 18
+    BTN_W, BTN_H, BTN_GAP, PAD, GRIP_W = 40, 34, 6, 7, 0   # GRIP_W=0：钉死不可拖,无把手
 
     def __init__(self):
         super().__init__()
@@ -1310,10 +1310,8 @@ class ControlBar(QWidget):
 
     # ── 锚定 / 跟随 ─────────────────────────────────────────────────────────
     def follow(self):
-        """录制/就绪阶段贴摄像区底部、水平居中；后处理固定屏幕左下角。
-        用户拖过(自由态)则不动。"""
-        if self._user_pos:
-            return
+        """录制/就绪阶段钉死在摄像区底部、水平居中；后处理固定屏幕左下角。
+        固定不可拖（操作区=摄像区，控制条必须稳定在内、始终可见可点）。"""
         scr = QApplication.primaryScreen().geometry()
         bw, bh = self.width(), self.height()
         if self._pos_mode == 'corner':             # 后处理：屏幕左下角固定
@@ -1340,32 +1338,9 @@ class ControlBar(QWidget):
         p.setPen(QPen(QColor(255, 255, 255, 28), 1))
         p.setBrush(QColor(18, 18, 18, 150))
         p.drawRoundedRect(r, 16, 16)
-        # 左侧拖动把手：三点
-        gx = self.PAD + self.GRIP_W / 2
-        cy = self.height() / 2
-        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(255, 255, 255, 90))
-        for dy in (-5, 0, 5):
-            p.drawEllipse(QPointF(gx, cy + dy), 1.5, 1.5)
         p.end()
 
-    # ── 拖动整条（落在按钮上的点击归按钮，落在把手/磨砂底归拖动）───────────────
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            self._drag_gp  = e.globalPosition().toPoint()
-            self._drag_wp  = self.pos()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-
-    def mouseMoveEvent(self, e):
-        if self._dragging and e.buttons() == Qt.MouseButton.LeftButton:
-            self._user_pos = True
-            self.move(self._drag_wp + (e.globalPosition().toPoint() - self._drag_gp))
-        else:
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
-
-    def mouseReleaseEvent(self, e):
-        self._dragging = False
-        self.setCursor(Qt.CursorShape.OpenHandCursor)
+    # 钉死在摄像区内,不可拖动：不处理鼠标拖拽（点击只归子按钮，磨砂底吞掉不移动）。
 
 
 # ── 裁切时间轴（灰底轨道 + 黄框保留区间 + 两端手柄/缩略图 + 播放头）──────────────────
