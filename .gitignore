@@ -19,6 +19,11 @@ dist/
 # 评测运行时报告
 eval_report_*.txt
 
+# whisper 模型(太大,超 GitHub 100MB;属 Lab,用下载脚本管理)
+ggml-*.bin
+# Lab 实验二进制(可由 .swift 源码重编)
+subtitle_file
+
 # macOS / IDE
 .DS_Store
 .claude/
