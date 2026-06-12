@@ -188,37 +188,95 @@ def cover(frame_bgr: np.ndarray, tw: int, th: int) -> np.ndarray:
 
 # ── 音频录制器 ────────────────────────────────────────────────────────────────
 class AudioRecorder:
-    """从指定设备录音，停止后写为 WAV 文件。"""
+    """从指定设备录音，停止后写为 WAV 文件。
 
-    def __init__(self, device_idx=None):
-        self.device = device_idx
-        self.ch     = 1
-        if device_idx is not None:
-            try:
-                self.ch = max(1, min(2, sd.query_devices(device_idx)['max_input_channels']))
-            except Exception:
-                pass
+    每次 start() 都刷新 PortAudio 并按「设备名」重新解析索引：蓝牙耳机
+    (AirPods 等) 在 app 启动后热插拔，启动时缓存的索引会失效甚至错位，
+    只按索引开流会拿不到任何样本 → 麦克风轨静默丢失。
+    采样率也不再硬编码 44100：蓝牙 HFP 输入常被锁在 24k/16k，硬开 44100
+    可能开得起来却收不到回调；优先用设备原生采样率，写 WAV 时如实记录，
+    最终重采样交给 ffmpeg 合成时统一处理。
+    """
+
+    def __init__(self, device_idx=None, device_name=None):
+        self.device  = device_idx
+        # "无麦克风" 是 UI 占位串，不是真实设备名，按"未指定名字"处理
+        self.name    = device_name if device_name and device_name != "无麦克风" else None
+        self.ch      = 1
+        self.sr      = SR          # 实际打开的采样率（写 WAV 用，可能 != SR）
         self._lock   = threading.Lock()
         self._chunks = []
         self._stream = None
         self.active  = False
         self.error   = None
 
+    def _resolve_device(self):
+        """刷新 PortAudio 后重新定位设备：优先按名字匹配（索引会随热插拔漂移），
+        名字找不到再退回原索引、再退回当前系统默认输入。返回索引或 None。"""
+        try:
+            sd._terminate(); sd._initialize()
+        except Exception:
+            pass
+        try:
+            devs = sd.query_devices()
+        except Exception:
+            return self.device
+        if self.name:                                  # 1) 按名字匹配仍在线的输入设备
+            for i, d in enumerate(devs):
+                if d['max_input_channels'] > 0 and d['name'] == self.name:
+                    return i
+        if self.device is not None:                    # 2) 原索引仍是有效输入设备就沿用
+            try:
+                di = int(self.device)
+                if 0 <= di < len(devs) and devs[di]['max_input_channels'] > 0:
+                    return di
+            except Exception:
+                pass
+        try:                                           # 3) 退回系统默认输入
+            di = sd.default.device[0]
+            if di is not None and int(di) >= 0:
+                return int(di)
+        except Exception:
+            pass
+        return None
+
     def start(self):
         self._chunks = []
         self.error   = None
-        if self.device is None:
+        self.active  = False
+        if self.device is None and not self.name:
+            return                                     # 用户明确选了"无音频"
+        dev = self._resolve_device()
+        if dev is None:
+            self.error = "未找到可用麦克风设备"
             return
+        self.device = dev
         try:
-            self._stream = sd.InputStream(
-                device=self.device, samplerate=SR,
-                channels=self.ch, dtype='float32',
-                blocksize=1024, callback=self._cb)
-            self._stream.start()
-            self.active = True
-        except Exception as e:
-            self.error  = str(e)
-            self.active = False
+            info      = sd.query_devices(dev)
+            self.ch   = max(1, min(2, info['max_input_channels']))
+            native_sr = int(info.get('default_samplerate') or SR)
+        except Exception:
+            self.ch = 1; native_sr = SR
+        # 候选采样率：原生优先（蓝牙 HFP 锁 24k/16k），再退常见值；第一个开得起来即用
+        candidates = []
+        for sr in (native_sr, SR, 48000, 24000, 16000):
+            if sr and sr not in candidates:
+                candidates.append(sr)
+        for sr in candidates:
+            try:
+                self._stream = sd.InputStream(
+                    device=dev, samplerate=sr,
+                    channels=self.ch, dtype='float32',
+                    blocksize=1024, callback=self._cb)
+                self._stream.start()
+                self.sr     = sr
+                self.active = True
+                self.error  = None
+                return
+            except Exception as e:
+                self.error  = str(e)
+                self._stream = None
+        # 全部采样率都失败：self.error 保留最后一次异常，active 仍为 False
 
     def _cb(self, indata, frames, time, status):
         with self._lock:
@@ -240,7 +298,7 @@ class AudioRecorder:
             with wave.open(path, 'w') as wf:
                 wf.setnchannels(self.ch)
                 wf.setsampwidth(2)
-                wf.setframerate(SR)
+                wf.setframerate(self.sr)
                 wf.writeframes(data16.tobytes())
             return True
         except Exception:
@@ -1418,9 +1476,11 @@ class CameraWindow(QWidget):
         if not ok:
             print(f"[录屏] 抓屏启动失败: {self._sys_daemon.error}")
 
-        # 麦克风
-        self._rec_mic = AudioRecorder(self.mic_idx)
+        # 麦克风（按设备名解析，规避蓝牙耳机热插拔后索引失效导致的静默丢轨）
+        self._rec_mic = AudioRecorder(self.mic_idx, self.mic_name)
         self._rec_mic.start()
+        if self._rec_mic.error:
+            print(f"[麦克风] 开流失败: {self._rec_mic.error}")
 
         self._rec_t0          = time.time()
         self._last_frame_time = None   # 最后一帧写入时刻，用于精准计算 itsscale
@@ -1498,10 +1558,15 @@ class CameraWindow(QWidget):
                 if os.path.exists(tmp_sys) and os.path.getsize(tmp_sys) > 0:
                     held_sys_wav = tmp_sys
 
+            # 麦克风：用户选了设备(有名字或索引)却没拿到 wav ⇒ 采集失败，需提示
+            mic_expected = bool(rec_mic and (rec_mic.name or rec_mic.device is not None))
             held_mic_wav = None
-            if rec_mic:
-                if rec_mic.stop_and_save(tmp_mic):
-                    held_mic_wav = tmp_mic
+            if rec_mic and rec_mic.stop_and_save(tmp_mic):
+                held_mic_wav = tmp_mic
+            self._mic_failed = mic_expected and not held_mic_wav
+            if self._mic_failed:
+                print(f"[麦克风] 未采集到音频(error={rec_mic.error if rec_mic else None}) "
+                      f"→ 本条仅系统音单轨")
 
             video_scale = 1.0
             if frames_written > 0 and rec_t0:
@@ -1553,8 +1618,14 @@ class CameraWindow(QWidget):
         # 保存按钮延迟启用：防止按 STOP 时鼠标未松开、切换后 mouseRelease 误触"保存"
         self.rec_btn.setEnabled(False)
         self._layout()
-        self.status_label.setText("留还是重来？")
-        self.status_label.setStyleSheet("color:#aaa;font-size:10px;background:transparent;")
+        if getattr(self, '_mic_failed', False):
+            self.status_label.setText("⚠️ 未采集到麦克风，仅系统音")
+            self.status_label.setStyleSheet(
+                "color:#FFB020;font-size:10px;background:transparent;")
+        else:
+            self.status_label.setText("留还是重来？")
+            self.status_label.setStyleSheet(
+                "color:#aaa;font-size:10px;background:transparent;")
         self.update()
         QTimer.singleShot(400, self._enable_save_btn)
 
