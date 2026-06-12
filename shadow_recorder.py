@@ -2892,6 +2892,12 @@ class CameraWindow(QWidget):
                 self._last_vregion_t   = time.time()
 
     # ── 鼠标 ──────────────────────────────────────────────────────────────
+    def _keep_ctrl_on_top(self):
+        # 点击摄像区会被系统抬到最前、盖住控制条;延后一拍(系统抬完后)把控制条重新置顶,
+        # 消除"点一下控制条闪现"的 z 轴竞争。
+        if self.ctrl and self.ctrl.isVisible():
+            QTimer.singleShot(0, self.ctrl.raise_)
+
     def mousePressEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton: return
         ly = e.position().toPoint().y()
@@ -2902,6 +2908,10 @@ class CameraWindow(QWidget):
             self._resizing          = False
             self._drag_global_start = gp
             self._drag_win_start    = self.pos()
+        self._keep_ctrl_on_top()
+
+    def mouseReleaseEvent(self, e):
+        self._keep_ctrl_on_top()
 
     def mouseMoveEvent(self, e):
         ly = e.position().toPoint().y()
