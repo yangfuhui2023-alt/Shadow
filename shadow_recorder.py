@@ -14,8 +14,8 @@ if getattr(sys, 'frozen', False):
     # PyInstaller .app bundle：Swift 二进制在 Contents/Frameworks/Shadow/
     _contents  = os.path.dirname(os.path.dirname(sys.executable))
     _SWIFT_DIR = os.path.join(_contents, 'Frameworks', 'Shadow')
-    # 安装版录制输出：用户指定存到项目内 screentest（本机硬编码绝对路径，换机/分发需改回通用路径）
-    OUTPUT_DIR = '/Users/yangxiaohui/Desktop/Claude Shadow/screentest'
+    # 安装版录制输出：固定通用路径，绝不写死项目绝对路径（移动文件夹/换机都不会断）
+    OUTPUT_DIR = os.path.expanduser('~/Movies/Shadow')
 else:
     _SWIFT_DIR = os.path.dirname(os.path.abspath(__file__))
     OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'screentest')
