@@ -16,7 +16,8 @@
 set -e
 
 CERT="Shadow Self Signed"
-SRC_DIR="/Users/yangxiaohui/Desktop/Claude Shadow"
+# 项目根 = 脚本所在目录，绝不写死绝对路径（移动文件夹也不会断）
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACTION="${1:-sign}"
 APP="${2:-/Applications/Shadow.app}"
 

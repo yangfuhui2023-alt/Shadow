@@ -32,6 +32,11 @@
 ```
 
 ## 注意
-- **录制输出目录**：spec/frozen 默认 `~/Movies/Shadow`（通用）。本机自用版会把 `OUTPUT_DIR` 改成项目内 `screentest`（构建前手动改，分发前改回）。
-- **版本号**：见 `Shadow.spec` 的 `CFBundleShortVersionString`/`CFBundleVersion`（待自动注入 git tag，见 STATUS）。
+- **录制输出目录**：安装版(frozen)**永远**是 `~/Movies/Shadow`（通用、与项目文件夹位置无关）。
+  ⚠️ **绝不要为了自用而手改 `OUTPUT_DIR` 成项目内绝对路径再打包** —— v1.1.1 就是这么把
+  `…/Desktop/Claude Shadow/screentest` 烧进发布产物，文件夹一移动合成就崩(见 v1.1.2 hotfix)。
+  自用想看 `screentest`，直接跑源码 `/usr/bin/python3 shadow_recorder.py`(源码版本走 `screentest`)。
+- **路径全部自动定位**：`Shadow.spec` 的 `src=SPECPATH`、`package_shadow.sh` 的 `SRC_DIR` 取脚本目录，
+  均不写死绝对路径，移动文件夹后照常可构建。
+- **版本号**：见 `Shadow.spec` 的 `CFBundleShortVersionString`/`CFBundleVersion`（当前 1.1.2；待自动注入 git tag，见 STATUS）。
 - **whisper 字幕（base.en + silero VAD 模型，~148MB）属 Lab 实验**，未进 Main；Promote 时再补"模型下载脚本 + 版本记录"（模型太大不入 git）。

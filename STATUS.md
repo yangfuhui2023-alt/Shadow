@@ -3,10 +3,14 @@
 > 协作规约见全局 `~/.claude/CLAUDE.md`(Main/Lab + Try/Promote/Hotfix)。本文件 = 随时可查的当前状态。
 
 ## ✅ Main(正式 = 你的 DMG = GitHub 版本)
-- **当前版本：v1.1.1**(tag,已推 GitHub)= `/Applications/Shadow.app` = `dist/Shadow.dmg`
-- 文件夹：`/Users/yangxiaohui/Desktop/Claude Shadow`(分支 `main`,工作区保持干净可发布)
+- **当前版本：v1.1.2**(tag,已推 GitHub)= `/Applications/Shadow.app` = `dist/Shadow.dmg`
+- 文件夹：`/Users/yangxiaohui/Desktop/Claude/Claude Shadow`(分支 `main`,工作区保持干净可发布)
 - 能力 = v1.0 + v1.1 + 麦克风丢轨修复。能力清单见 memory/capability_baseline_v1_1.md
 - 构建配方:`BUILD.md`;依赖:`requirements.txt`
+- v1.1.2(hotfix):**根治「移动文件夹后合成失败」** —— 病灶是 v1.1.1 把输出目录写死成
+  `…/Desktop/Claude Shadow/screentest`(BUILD.md「构建前手改 OUTPUT_DIR」footgun + spec/脚本写死旧路径)。
+  现:`Shadow.spec` 用 `SPECPATH`、`package_shadow.sh` 取脚本目录、安装版输出固定 `~/Movies/Shadow`,
+  全链路无写死绝对路径;CFBundleVersion 升到 1.1.2。
 - v1.1.1 相对 v1.1:fix 蓝牙麦克风丢轨 + chore 可复现构建
 
 ## 🧪 Lab(实验 = 不碰 DMG)
@@ -23,5 +27,5 @@
 
 ## 待办 / 规约执行
 - Promote 任何 Lab 功能前:过最小验收(录1条→确认3音轨→保存→播放),升 semver,出 DMG,推 GitHub。
-- 还没做的机制:发布产物自报版本(CFBundleVersion 注入 git tag,现仍写死 1.0.0)。
+- 还没做的机制:发布产物自报版本——CFBundleVersion 已手动同步到 1.1.2,但仍待「自动注入 git tag」。
 - 实验持久备份:`~/ShadowLab_backup/`。

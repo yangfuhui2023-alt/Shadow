@@ -3,7 +3,9 @@ import os, sys
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 block_cipher = None
-src = '/Users/yangxiaohui/Desktop/Claude Shadow'
+# 项目根目录：从 spec 文件自身位置推导（PyInstaller 注入的 SPECPATH），
+# 绝不写死绝对路径——移动文件夹也不会断。
+src = SPECPATH
 
 a = Analysis(
     [os.path.join(src, 'shadow_recorder.py')],
@@ -81,8 +83,8 @@ app = BUNDLE(
         'NSSpeechRecognitionUsageDescription': 'Shadow 需要语音识别权限来生成实时字幕。',
         'NSCameraUsageDescription': 'Shadow 需要摄像头权限来录制您的画面。',
         'LSUIElement': True,
-        'CFBundleShortVersionString': '1.0.0',
-        'CFBundleVersion': '1.0.0',
+        'CFBundleShortVersionString': '1.1.2',
+        'CFBundleVersion': '1.1.2',
         'CFBundleName': 'Shadow',
         'CFBundleDisplayName': 'Shadow',
     },
