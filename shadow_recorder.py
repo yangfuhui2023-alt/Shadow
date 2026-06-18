@@ -37,6 +37,10 @@ _TMPDIR = tempfile.gettempdir()
 _FFMPEG = shutil.which("ffmpeg", path=os.environ.get("PATH","") + ":/opt/homebrew/bin:/usr/local/bin") or "ffmpeg"
 _FFPROBE = shutil.which("ffprobe", path=os.environ.get("PATH","") + ":/opt/homebrew/bin:/usr/local/bin") or "ffprobe"
 
+# 蓝牙麦(AirPods 等)输入延迟补偿：合成时把麦轨整体提前这么多秒，让"你的声音"对上"你的口型"。
+# 蓝牙麦录到的声音比画面晚 ~0.2s（HFP 传输延迟），内置/有线麦没有此延迟，可设 0。
+MIC_SYNC_LEAD_S = 0.20
+
 import sounddevice as sd
 import wave
 
@@ -637,11 +641,11 @@ def merge_and_save(scr_video, cam_video, sys_wav, mic_wav, output, signals: Merg
 
         if sys_in is not None and mic_in is not None:
             # 系统音延后 delay_ms（adelay 垫前导静音）后一分为二：一路进混音、一路作独立轨。
-            # 麦克风不延后（其起始已≈画面）。混音从 0 起 ⇒ 麦克风不被拖后。
+            # 麦克风提前 MIC_SYNC_LEAD_S 秒（atrim 裁头部）补偿蓝牙麦输入延迟，对上口型。
             # 每条轨按各自音量 volume=* 缩放（混音整体 / 系统音独立 / 麦克风独立）。
             sd_pre = f"[{sys_in}:a]adelay={delay_ms}:all=1," if delay_ms > 0 else f"[{sys_in}:a]"
             filters.append(f"{sd_pre}asplit=2[sa_mix][sa_out]")
-            filters.append(f"[{mic_in}:a]asplit=2[ma_mix][ma_out]")
+            filters.append(f"[{mic_in}:a]atrim=start={MIC_SYNC_LEAD_S:.3f},asetpts=PTS-STARTPTS,asplit=2[ma_mix][ma_out]")
             filters.append("[sa_mix][ma_mix]amix=inputs=2:duration=longest[mixed0]")
             filters.append(f"[mixed0]volume={vol_mix:.3f}[mixed]")
             filters.append(f"[sa_out]volume={vol_sys:.3f}[sysout]")
@@ -658,7 +662,7 @@ def merge_and_save(scr_video, cam_video, sys_wav, mic_wav, output, signals: Merg
             maps += ['-map', '[sysout]']
             meta += ['-metadata:s:a:0', 'title=System Audio']
         elif mic_in is not None:
-            filters.append(f"[{mic_in}:a]volume={vol_mic:.3f}[micout]")
+            filters.append(f"[{mic_in}:a]atrim=start={MIC_SYNC_LEAD_S:.3f},asetpts=PTS-STARTPTS,volume={vol_mic:.3f}[micout]")
             maps += ['-map', '[micout]']
             meta += ['-metadata:s:a:0', 'title=Microphone']
 
